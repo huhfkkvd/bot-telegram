@@ -1,11 +1,7 @@
 import asyncio
-import html
 import logging
-import os
-from time import monotonic
 
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,8 +13,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    FSInputFile,
-    ErrorEvent,
 )
 
 import config
@@ -32,44 +26,9 @@ dp = Dispatcher(storage=MemoryStorage())
 BOT_USERNAME = ""  # در main() پر میشه
 
 
-# ---------- Rate limit / آنتی‌اسپم ----------
-class ThrottlingMiddleware(BaseMiddleware):
-    """جلوگیری از اسپم کردن دکمه‌ها یا ثبت پشت‌سرهم سفارش توسط یه کاربر."""
-
-    def __init__(self, rate_limit: float = 0.6):
-        self.rate_limit = rate_limit
-        self.last_call: dict[int, float] = {}
-
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if user is not None:
-            now = monotonic()
-            last = self.last_call.get(user.id)
-            if last is not None and (now - last) < self.rate_limit:
-                if isinstance(event, CallbackQuery):
-                    await event.answer("⏳ لطفاً کمی آروم‌تر بزنید!", show_alert=False)
-                return  # این درخواست به‌خاطر اسپم بودن نادیده گرفته میشه
-            self.last_call[user.id] = now
-            try:
-                await db.touch_user(user.id, user.username or "", user.full_name or "")
-            except Exception:
-                pass  # ثبت کاربر نباید جلوی پردازش اصلی رو بگیره
-        return await handler(event, data)
-
-
-dp.message.outer_middleware(ThrottlingMiddleware(rate_limit=0.7))
-dp.callback_query.outer_middleware(ThrottlingMiddleware(rate_limit=0.4))
-
-
 # ---------- States ----------
 class BuyStates(StatesGroup):
     waiting_for_receipt = State()
-    entering_coupon_code = State()
-
-
-class WalletStates(StatesGroup):
-    entering_topup_amount = State()
-    waiting_for_topup_receipt = State()
 
 
 class AdminStates(StatesGroup):
@@ -82,57 +41,19 @@ class AdminStates(StatesGroup):
     adding_multi_label = State()
     adding_multi_price = State()
     editing_welcome_message = State()
-    editing_referral_percent = State()
-    editing_rules_text = State()
-    adding_coupon_code = State()
-    adding_coupon_percent = State()
-    adding_coupon_maxuses = State()
-    editing_wallet_bonus_threshold = State()
-    editing_wallet_bonus_percent = State()
-    searching_users = State()
-    editing_wallet_balance = State()
-    broadcasting_message = State()
-    adding_admin_id = State()
-
-
-# ---------- سطوح دسترسی ادمین‌ها ----------
-# owner   = مالک ربات (از ENV، config.ADMIN_IDS) - دسترسی کامل به همه‌چیز
-# manager = ادمین سطح ۲ - دسترسی به کاربران + کدهای تخفیف
-# support = ادمین سطح ۱ - فقط دسترسی به بخش کاربران
-ADMIN_ROLE_LABELS = {
-    "owner": "👑 مالک ربات",
-    "manager": "🥈 ادمین سطح ۲ (کاربران + کدهای تخفیف)",
-    "support": "🥉 ادمین سطح ۱ (فقط کاربران)",
-}
-
-
-async def get_admin_role(user_id: int) -> str | None:
-    """نقش ادمین رو برمی‌گردونه: 'owner' / 'manager' / 'support' یا None اگه ادمین نباشه."""
-    if user_id in config.ADMIN_IDS:
-        return "owner"
-    return await db.get_admin_role(user_id)
-
-
-async def can_manage_coupons(role: str | None) -> bool:
-    return role in ("owner", "manager")
-
-
-async def get_all_admin_ids() -> list[int]:
-    """آیدی همه‌ی ادمین‌ها (مالک + ادمین‌های سطح ۱ و ۲) برای اطلاع‌رسانی سفارش‌ها و واریزی‌های جدید."""
-    managed = await db.list_admins()
-    ids = set(config.ADMIN_IDS)
-    ids.update(a["user_id"] for a in managed)
-    return list(ids)
+    editing_referral_count = State()
+    editing_referral_volume = State()
 
 
 # ---------- Keyboards ----------
-async def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
+def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text="🛍 خرید سرویس"), KeyboardButton(text="🖥 سرویس‌های من")],
+        [KeyboardButton(text="🛍 خرید سرویس")],
+        [KeyboardButton(text="🖥 سرویس‌های من")],
         [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="💬 پشتیبانی")],
-        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="📜 قوانین")],
+        [KeyboardButton(text="🤝 دعوت دوستان")],
     ]
-    if user_id is not None and await get_admin_role(user_id) is not None:
+    if user_id is not None and user_id in config.ADMIN_IDS:
         keyboard.append([KeyboardButton(text="🛠 مدیریت ربات")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -177,30 +98,14 @@ def multi_plans_kb(plans) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def build_order_summary_kb(order) -> InlineKeyboardMarkup:
-    """کیبورد صفحه خلاصه سفارش: ارسال رسید، کد تخفیف، پرداخت با کیف پول (در صورت کافی بودن موجودی) یا بازگشت."""
-    kind = "gaming" if str(order["plan_name"]).startswith("🎮") else "multi"
-    rows = [[InlineKeyboardButton(text="📤 ارسال رسید", callback_data=f"reqreceipt:{order['id']}")]]
-
-    if order["coupon_code"]:
-        rows.append(
-            [
-                InlineKeyboardButton(text="🔄 تغییر کد تخفیف", callback_data=f"applycoupon:{order['id']}"),
-                InlineKeyboardButton(text="🗑 حذف تخفیف", callback_data=f"removecoupon:{order['id']}"),
-            ]
-        )
-    else:
-        rows.append([InlineKeyboardButton(text="🎟 اعمال کد تخفیف", callback_data=f"applycoupon:{order['id']}")])
-
-    if order["price"] and order["price"] > 0:
-        balance = await db.get_wallet_balance(order["user_id"])
-        if balance >= order["price"]:
-            rows.append(
-                [InlineKeyboardButton(text=f"💰 پرداخت با کیف پول ({balance:,} تومان)", callback_data=f"walletpay:{order['id']}")]
-            )
-
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"cancelorder:{order['id']}:{kind}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def order_summary_kb(order_id: int, kind: str) -> InlineKeyboardMarkup:
+    """کیبورد صفحه خلاصه سفارش: ارسال رسید یا بازگشت (لغو سفارش و برگشت به لیست تعرفه‌ها)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 ارسال رسید", callback_data=f"reqreceipt:{order_id}")],
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"cancelorder:{order_id}:{kind}")],
+        ]
+    )
 
 
 def waiting_receipt_kb(order_id: int) -> InlineKeyboardMarkup:
@@ -211,18 +116,11 @@ def waiting_receipt_kb(order_id: int) -> InlineKeyboardMarkup:
 
 
 def order_summary_text(order) -> str:
-    price_block = f"💰 قیمت: {order['price']:,} تومان"
-    if order["coupon_code"]:
-        price_block = (
-            f"💵 قیمت اصلی: {order['original_price']:,} تومان\n"
-            f"🎟 کد تخفیف: {order['coupon_code']}\n"
-            f"💰 قیمت نهایی: {order['price']:,} تومان"
-        )
     return (
         f"🧾 <b>خلاصه سفارش شما</b>\n"
         f"—————————————\n"
         f"📦 {order['plan_name']}\n"
-        f"{price_block}\n"
+        f"💰 قیمت: {order['price']:,} تومان\n"
         f"—————————————\n\n"
         f"💳 شماره کارت: <code>{config.CARD_NUMBER}</code>\n"
         f"👤 به نام: {config.CARD_HOLDER}\n\n"
@@ -245,13 +143,6 @@ def admin_decision_kb(order_id: int) -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
-
-    # ثبت/بروزرسانی کاربر در جدول کاربران (برای بخش «کاربران» در پنل مدیریت)
-    await db.touch_user(
-        message.from_user.id,
-        message.from_user.username or "",
-        message.from_user.full_name or "",
-    )
 
     # پردازش لینک دعوت (رفرال) در صورت وجود
     args = command.args
@@ -283,7 +174,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
             f"🌍 سرویس مولتی لوکیشن (وبگردی) با پلن نامحدود\n\n"
             f"🟢 سرویس فعال دارید؟ از دکمه «🖥 سرویس‌های من» وارد شوید"
         )
-    await message.answer(text, parse_mode="HTML", reply_markup=await main_menu_kb(message.from_user.id))
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb(message.from_user.id))
 
 
 @dp.message(F.text == "🛍 خرید سرویس")
@@ -387,7 +278,7 @@ async def choose_gaming_plan(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     order = await db.get_order(order_id)
     await callback.message.edit_text(
-        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
+        order_summary_text(order), parse_mode="HTML", reply_markup=order_summary_kb(order_id, "gaming")
     )
     await callback.answer()
 
@@ -414,7 +305,7 @@ async def choose_multi_plan(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     order = await db.get_order(order_id)
     await callback.message.edit_text(
-        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
+        order_summary_text(order), parse_mode="HTML", reply_markup=order_summary_kb(order_id, "multi")
     )
     await callback.answer()
 
@@ -449,122 +340,11 @@ async def back_to_order_summary(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
+    kind = "gaming" if str(order["plan_name"]).startswith("🎮") else "multi"
     await callback.message.edit_text(
-        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
+        order_summary_text(order), parse_mode="HTML", reply_markup=order_summary_kb(order_id, kind)
     )
     await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("applycoupon:"))
-async def start_apply_coupon(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    order = await db.get_order(order_id)
-    if not order or order["user_id"] != callback.from_user.id:
-        await callback.answer("این سفارش پیدا نشد.", show_alert=True)
-        return
-    if order["status"] not in ("awaiting_receipt", "pending"):
-        await callback.answer("این سفارش دیگه قابل ویرایش نیست.", show_alert=True)
-        return
-
-    await state.update_data(order_id=order_id)
-    await state.set_state(BuyStates.entering_coupon_code)
-    await callback.message.edit_text(
-        "🎟 کد تخفیف رو وارد کنید:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"backsummary:{order_id}")]]
-        ),
-    )
-    await callback.answer()
-
-
-@dp.message(BuyStates.entering_coupon_code)
-async def apply_coupon_code(message: Message, state: FSMContext):
-    data = await state.get_data()
-    order_id = data.get("order_id")
-    order = await db.get_order(order_id) if order_id else None
-    if not order:
-        await message.answer("مشکلی پیش اومد، لطفاً دوباره از منو پلن رو انتخاب کنید.")
-        await state.clear()
-        return
-
-    code = (message.text or "").strip().upper()
-    coupon = await db.get_coupon(code)
-
-    if not coupon or not coupon["active"]:
-        await message.answer("❌ این کد تخفیف معتبر نیست. یه کد دیگه امتحان کنید یا از دکمه بازگشت استفاده کنید.")
-        return
-    if coupon["max_uses"] is not None and coupon["used_count"] >= coupon["max_uses"]:
-        await message.answer("❌ ظرفیت استفاده از این کد تخفیف تموم شده. یه کد دیگه امتحان کنید.")
-        return
-
-    new_price = int(order["original_price"] * (100 - coupon["percent"]) / 100)
-    await db.apply_coupon_to_order(order_id, code, new_price)
-    await db.increment_coupon_usage(code)
-    await state.clear()
-
-    order = await db.get_order(order_id)
-    await message.answer(
-        f"✅ کد تخفیف {code} ({coupon['percent']}٪) با موفقیت اعمال شد!",
-    )
-    await message.answer(
-        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
-    )
-
-
-@dp.callback_query(F.data.startswith("removecoupon:"))
-async def remove_coupon(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    order = await db.get_order(order_id)
-    if not order or order["user_id"] != callback.from_user.id:
-        await callback.answer("این سفارش پیدا نشد.", show_alert=True)
-        return
-
-    await db.remove_coupon_from_order(order_id)
-    await state.clear()
-    order = await db.get_order(order_id)
-    await callback.message.edit_text(
-        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
-    )
-    await callback.answer("کد تخفیف حذف شد.")
-
-
-@dp.callback_query(F.data.startswith("walletpay:"))
-async def pay_with_wallet(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    order = await db.get_order(order_id)
-    if not order or order["user_id"] != callback.from_user.id:
-        await callback.answer("این سفارش پیدا نشد.", show_alert=True)
-        return
-    if order["status"] not in ("awaiting_receipt", "pending"):
-        await callback.answer("این سفارش دیگه قابل پرداخت نیست.", show_alert=True)
-        return
-
-    ok = await db.deduct_wallet_balance(order["user_id"], order["price"])
-    if not ok:
-        await callback.answer("موجودی کیف پول شما کافی نیست.", show_alert=True)
-        return
-
-    await db.mark_order_paid_by_wallet(order_id)
-    await state.clear()
-
-    await callback.message.edit_text(
-        "✅ پرداخت با موفقیت از کیف پول انجام شد.\nسفارش شما برای بررسی و تحویل به ادمین ارسال شد.",
-        reply_markup=back_menu_kb(),
-    )
-    await callback.answer()
-
-    caption = (
-        f"🆕 سفارش جدید #{order_id} (💰 پرداخت با کیف پول)\n"
-        f"👤 کاربر: {order['full_name']} (@{order['username'] or '-'})\n"
-        f"🆔 آیدی عددی: {order['user_id']}\n"
-        f"📦 پلن: {order['plan_name']}\n"
-        f"💰 مبلغ: {order['price']:,} تومان"
-    )
-    for admin_id in await get_all_admin_ids():
-        try:
-            await bot.send_message(admin_id, caption, reply_markup=admin_decision_kb(order_id))
-        except Exception as e:
-            logging.warning(f"Could not notify admin {admin_id}: {e}")
 
 
 @dp.message(BuyStates.waiting_for_receipt, F.photo | F.document)
@@ -583,7 +363,7 @@ async def receive_receipt(message: Message, state: FSMContext):
     await message.answer(
         "🕐 رسید شما دریافت شد و برای بررسی به ادمین ارسال شد. "
         "به محض تأیید، اطلاعات سرویس ارسال میشه.",
-        reply_markup=await main_menu_kb(message.from_user.id),
+        reply_markup=main_menu_kb(message.from_user.id),
     )
     await state.clear()
 
@@ -595,7 +375,7 @@ async def receive_receipt(message: Message, state: FSMContext):
         f"💰 مبلغ: {order['price']:,} تومان"
     )
 
-    for admin_id in await get_all_admin_ids():
+    for admin_id in config.ADMIN_IDS:
         try:
             if message.photo:
                 await bot.send_photo(
@@ -704,255 +484,15 @@ async def back_to_my_orders_list(callback: CallbackQuery):
     await callback.answer()
 
 
-def topup_summary_text(topup) -> str:
-    return (
-        f"🧾 <b>شارژ کیف پول</b>\n"
-        f"—————————————\n"
-        f"💰 مبلغ: {topup['amount']:,} تومان\n"
-        f"—————————————\n\n"
-        f"💳 شماره کارت: <code>{config.CARD_NUMBER}</code>\n"
-        f"👤 به نام: {config.CARD_HOLDER}\n\n"
-        f"ℹ️ پس از واریز وجه، روی دکمه «📤 ارسال رسید» بزنید و سپس عکس یا فایل رسید رو ارسال کنید."
-    )
-
-
-def topup_summary_kb(topup_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📤 ارسال رسید", callback_data=f"topupreq:{topup_id}")],
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"topupcancel:{topup_id}")],
-        ]
-    )
-
-
-def topup_waiting_receipt_kb(topup_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"topupback:{topup_id}")]]
-    )
-
-
-def topup_decision_kb(topup_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ تأیید و شارژ", callback_data=f"wapprove:{topup_id}"),
-                InlineKeyboardButton(text="❌ رد", callback_data=f"wreject:{topup_id}"),
-            ]
-        ]
-    )
-
-
 @dp.message(F.text == "💰 کیف پول")
 async def wallet_handler(message: Message, state: FSMContext):
     await state.clear()
-    balance = await db.get_wallet_balance(message.from_user.id)
-    threshold = await db.get_wallet_bonus_threshold()
-    bonus_percent = await db.get_wallet_bonus_percent()
     text = (
-        f"💰 <b>کیف پول شما</b>\n\n"
-        f"موجودی فعلی: <b>{balance:,} تومان</b>\n\n"
-        f"می‌تونید کیف پولتون رو شارژ کنید و در خریدهای بعدی بدون نیاز به ارسال رسید، از همون پرداخت کنید.\n\n"
-        f"🎁 شارژهای <b>{threshold:,} تومان</b> به بالا، <b>{bonus_percent}٪ هدیه اضافه</b> می‌گیرن!"
+        "💰 <b>کیف پول شما</b>\n\n"
+        "موجودی فعلی: 0 تومان\n\n"
+        "🔜 این بخش به‌زودی برای شارژ کیف پول و پرداخت خودکار فعال میشه."
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ شارژ کیف پول", callback_data="topupwallet")],
-            [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
-        ]
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-
-@dp.callback_query(F.data == "topupwallet")
-async def start_topup(callback: CallbackQuery, state: FSMContext):
-    threshold = await db.get_wallet_bonus_threshold()
-    bonus_percent = await db.get_wallet_bonus_percent()
-    await state.set_state(WalletStates.entering_topup_amount)
-    await callback.message.edit_text(
-        f"💳 مبلغ مورد نظر برای شارژ کیف پول رو به تومان وارد کنید (فقط عدد، مثال: 200000):\n\n"
-        f"🎁 نکته: شارژ {threshold:,} تومان به بالا، {bonus_percent}٪ هدیه اضافه می‌گیره!",
-        reply_markup=back_menu_kb(),
-    )
-    await callback.answer()
-
-
-@dp.message(WalletStates.entering_topup_amount)
-async def receive_topup_amount(message: Message, state: FSMContext):
-    text = (message.text or "").replace(",", "").strip()
-    if not text.isdigit() or int(text) <= 0:
-        await message.answer("لطفاً فقط عدد بزرگ‌تر از صفر بفرستید (مثال: 200000)")
-        return
-
-    amount = int(text)
-    topup_id = await db.create_wallet_topup(
-        message.from_user.id, message.from_user.username or "", message.from_user.full_name, amount
-    )
-    await state.clear()
-    topup = await db.get_wallet_topup(topup_id)
-    await message.answer(topup_summary_text(topup), parse_mode="HTML", reply_markup=topup_summary_kb(topup_id))
-
-
-@dp.callback_query(F.data.startswith("topupcancel:"))
-async def cancel_topup(callback: CallbackQuery, state: FSMContext):
-    topup_id = int(callback.data.split(":")[1])
-    topup = await db.get_wallet_topup(topup_id)
-    if topup and topup["user_id"] == callback.from_user.id and topup["status"] in ("awaiting_receipt", "pending"):
-        await db.set_topup_status(topup_id, "cancelled")
-    await state.clear()
-    await callback.message.edit_text("🚫 درخواست شارژ کیف پول لغو شد.", reply_markup=back_menu_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("topupreq:"))
-async def request_topup_receipt(callback: CallbackQuery, state: FSMContext):
-    topup_id = int(callback.data.split(":")[1])
-    topup = await db.get_wallet_topup(topup_id)
-    if not topup or topup["user_id"] != callback.from_user.id:
-        await callback.answer("این درخواست پیدا نشد.", show_alert=True)
-        return
-    if topup["status"] not in ("awaiting_receipt", "pending"):
-        await callback.answer("این درخواست دیگه در وضعیت ارسال رسید نیست.", show_alert=True)
-        return
-
-    await state.update_data(topup_id=topup_id)
-    await state.set_state(WalletStates.waiting_for_topup_receipt)
-    await callback.message.edit_text(
-        "📸 لطفاً عکس یا فایل رسید واریزی رو همینجا ارسال کنید.",
-        reply_markup=topup_waiting_receipt_kb(topup_id),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("topupback:"))
-async def back_to_topup_summary(callback: CallbackQuery, state: FSMContext):
-    topup_id = int(callback.data.split(":")[1])
-    topup = await db.get_wallet_topup(topup_id)
-    if not topup or topup["user_id"] != callback.from_user.id:
-        await callback.answer("این درخواست پیدا نشد.", show_alert=True)
-        return
-
-    await state.clear()
-    await callback.message.edit_text(
-        topup_summary_text(topup), parse_mode="HTML", reply_markup=topup_summary_kb(topup_id)
-    )
-    await callback.answer()
-
-
-@dp.message(WalletStates.waiting_for_topup_receipt, F.photo | F.document)
-async def receive_topup_receipt(message: Message, state: FSMContext):
-    data = await state.get_data()
-    topup_id = data.get("topup_id")
-    if not topup_id:
-        await message.answer("مشکلی پیش اومد، لطفاً دوباره از «💰 کیف پول» شروع کنید.")
-        await state.clear()
-        return
-
-    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-    await db.attach_topup_receipt(topup_id, file_id)
-    topup = await db.get_wallet_topup(topup_id)
-
-    await message.answer(
-        "🕐 رسید شما دریافت شد و برای بررسی به ادمین ارسال شد. "
-        "به محض تأیید، کیف پولتون شارژ میشه.",
-        reply_markup=await main_menu_kb(message.from_user.id),
-    )
-    await state.clear()
-
-    caption = (
-        f"💰 درخواست شارژ کیف پول #{topup_id}\n"
-        f"👤 کاربر: {topup['full_name']} (@{topup['username'] or '-'})\n"
-        f"🆔 آیدی عددی: {topup['user_id']}\n"
-        f"💵 مبلغ: {topup['amount']:,} تومان"
-    )
-    for admin_id in await get_all_admin_ids():
-        try:
-            if message.photo:
-                await bot.send_photo(
-                    admin_id, photo=file_id, caption=caption, reply_markup=topup_decision_kb(topup_id)
-                )
-            else:
-                await bot.send_document(
-                    admin_id, document=file_id, caption=caption, reply_markup=topup_decision_kb(topup_id)
-                )
-        except Exception as e:
-            logging.warning(f"Could not notify admin {admin_id}: {e}")
-
-
-@dp.message(WalletStates.waiting_for_topup_receipt)
-async def waiting_topup_receipt_wrong_input(message: Message):
-    await message.answer("لطفاً عکس یا فایل رسید واریزی رو ارسال کنید 📸")
-
-
-@dp.callback_query(F.data.startswith("wapprove:"))
-async def admin_approve_topup(callback: CallbackQuery):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-
-    topup_id = int(callback.data.split(":")[1])
-    topup = await db.get_wallet_topup(topup_id)
-    if not topup:
-        await callback.answer("این درخواست پیدا نشد.", show_alert=True)
-        return
-    if topup["status"] == "approved":
-        await callback.answer("این درخواست قبلاً تأیید شده.", show_alert=True)
-        return
-
-    await db.set_topup_status(topup_id, "approved")
-
-    threshold = await db.get_wallet_bonus_threshold()
-    bonus_percent = await db.get_wallet_bonus_percent()
-    bonus = 0
-    if threshold > 0 and bonus_percent > 0 and topup["amount"] >= threshold:
-        bonus = int(topup["amount"] * bonus_percent / 100)
-
-    credit_amount = topup["amount"] + bonus
-    await db.add_wallet_balance(topup["user_id"], credit_amount)
-    new_balance = await db.get_wallet_balance(topup["user_id"])
-
-    bonus_note = f"\n🎁 چون شارژتون {threshold:,} تومان یا بیشتر بود، {bonus:,} تومان هدیه هم گرفتید!" if bonus > 0 else ""
-
-    try:
-        await bot.send_message(
-            topup["user_id"],
-            f"✅ کیف پول شما به مبلغ {topup['amount']:,} تومان شارژ شد.{bonus_note}\n"
-            f"💰 موجودی جدید: {new_balance:,} تومان",
-        )
-    except Exception as e:
-        logging.warning(f"Could not notify user about wallet charge: {e}")
-
-    await callback.message.answer(
-        f"✅ شارژ کیف پول #{topup_id} تأیید شد و کیف پول کاربر شارژ شد."
-        + (f" (شامل {bonus:,} تومان هدیه پلکانی)" if bonus > 0 else "")
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("wreject:"))
-async def admin_reject_topup(callback: CallbackQuery):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-
-    topup_id = int(callback.data.split(":")[1])
-    topup = await db.get_wallet_topup(topup_id)
-    if not topup:
-        await callback.answer("این درخواست پیدا نشد.", show_alert=True)
-        return
-
-    await db.set_topup_status(topup_id, "rejected")
-
-    try:
-        await bot.send_message(
-            topup["user_id"],
-            f"❌ متأسفانه درخواست شارژ کیف پول شما رد شد.\n"
-            f"در صورت وجود اشتباه در واریزی، لطفاً با پشتیبانی در ارتباط باشید.",
-        )
-    except Exception as e:
-        logging.warning(f"Could not notify user: {e}")
-
-    await callback.message.answer(f"❌ شارژ کیف پول #{topup_id} رد شد و به کاربر اطلاع داده شد.")
-    await callback.answer()
+    await message.answer(text, parse_mode="HTML", reply_markup=back_menu_kb())
 
 
 @dp.message(F.text == "💬 پشتیبانی")
@@ -967,29 +507,6 @@ async def support_handler(message: Message, state: FSMContext):
     await message.answer("💬 برای ارتباط با پشتیبانی روی دکمه زیر بزنید:", reply_markup=kb)
 
 
-DEFAULT_RULES_TEXT = (
-    "📜 <b>قوانین و مقررات استفاده از ربات</b>\n\n"
-    "۱️⃣ خرید سرویس از این ربات به معنی پذیرش کامل این قوانینه.\n"
-    "۲️⃣ اطلاعات سرویس (کانفیگ/یوزرنیم/پسورد) فقط برای استفاده شخصی شماست؛ اشتراک‌گذاری یا فروش مجدد اون بدون هماهنگی با پشتیبانی مجاز نیست.\n"
-    "۳️⃣ بعد از ارسال رسید یا پرداخت با کیف پول، سفارش شما در سریع‌ترین زمان ممکن توسط ادمین بررسی و تحویل داده میشه.\n"
-    "۴️⃣ در صورت واریز اشتباه یا مغایرت مبلغ، سفارش ممکنه رد بشه؛ لطفاً از طریق پشتیبانی پیگیری کنید.\n"
-    "۵️⃣ وجه واریزی برای سرویس‌های تحویل‌داده‌شده قابل استرداد نیست، مگر در صورت وجود مشکل فنی از سمت ما.\n"
-    "۶️⃣ موجودی کیف پول فقط داخل همین ربات و برای خرید سرویس قابل استفاده است و قابل برداشت نقدی نیست.\n"
-    "۷️⃣ استفاده از سرویس‌ها برای فعالیت‌های غیرقانونی یا مخرب (هک، اسپم، آزار دیگران و ...) ممنوعه و در صورت مشاهده، سرویس بدون اطلاع قبلی مسدود میشه.\n"
-    "۸️⃣ قیمت‌ها و تعرفه‌ها ممکنه بدون اطلاع قبلی تغییر کنن؛ قیمت لحظه ثبت سفارش ملاک نهایی است.\n"
-    "۹️⃣ برای هرگونه سؤال یا مشکل، از بخش «💬 پشتیبانی» با ما در ارتباط باشید.\n\n"
-    "با تشکر از اعتماد شما 🙏"
-)
-
-
-@dp.message(F.text == "📜 قوانین")
-async def rules_handler(message: Message, state: FSMContext):
-    await state.clear()
-    custom_rules = await db.get_rules_text()
-    text = custom_rules if custom_rules else DEFAULT_RULES_TEXT
-    await message.answer(text, parse_mode="HTML", reply_markup=back_menu_kb())
-
-
 @dp.message(F.text == "🤝 دعوت دوستان")
 async def invite_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -997,41 +514,88 @@ async def invite_handler(message: Message, state: FSMContext):
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{referrer_id}"
     total = await db.count_referrals(referrer_id)
     converted = await db.count_converted_referrals(referrer_id)
-    commission_percent = await db.get_referral_commission_percent()
-    total_earned = await db.get_total_referral_earnings(referrer_id)
+    claimed = await db.has_claimed_reward(referrer_id)
+    required_count = await db.get_referral_required_count()
+    reward_volume = await db.get_referral_reward_volume()
 
     text = (
         f"🤝 <b>دعوت دوستان</b>\n\n"
         f"لینک اختصاصی شما:\n<code>{link}</code>\n\n"
         f"👥 تعداد افراد دعوت‌شده: {total}\n"
-        f"✅ تعداد خریدهای موفق زیرمجموعه: {converted}\n"
-        f"💰 مجموع پورسانتی دریافتی تا الان: <b>{total_earned:,} تومان</b>\n\n"
-        f"🎁 به‌ازای <b>هر</b> خرید موفق دوستانی که با لینک شما وارد بشن، <b>{commission_percent}٪</b> از "
-        f"مبلغ خریدشون بلافاصله و به‌صورت نقدی به کیف پول شما اضافه میشه — برای همیشه و بدون محدودیت تعداد دفعات! 💸"
+        f"✅ تعداد خریدهای موفق: {converted}\n\n"
+        f"🎁 اگر <b>{required_count} نفر</b> با لینک شما وارد بشن و خرید کنن، "
+        f"یک سرویس گیمینگ <b>{reward_volume} گیگ</b> به‌صورت <b>رایگان</b> بهتون تعلق می‌گیره! 🎉"
     )
 
-    await message.answer(text, parse_mode="HTML", reply_markup=back_menu_kb())
+    if converted >= required_count and not claimed:
+        text += "\n\n🎉 شما واجد شرایط دریافت هدیه هستید!"
+        rows = [
+            [InlineKeyboardButton(text=f"🎁 دریافت سرویس گیمینگ {reward_volume} گیگ رایگان", callback_data="claimref")],
+            [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    else:
+        kb = back_menu_kb()
+
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "claimref")
+async def claim_referral_reward(callback: CallbackQuery, state: FSMContext):
+    referrer_id = callback.from_user.id
+    converted = await db.count_converted_referrals(referrer_id)
+    already_claimed = await db.has_claimed_reward(referrer_id)
+    required_count = await db.get_referral_required_count()
+    reward_volume = await db.get_referral_reward_volume()
+
+    if converted < required_count or already_claimed:
+        await callback.answer("شرایط دریافت هدیه رو ندارید یا قبلاً دریافتش کردید.", show_alert=True)
+        return
+
+    await db.set_reward_claimed(referrer_id)
+    plan_name = f"🎮 سرویس گیمینگ - {reward_volume} گیگ (هدیه رفرال 🎁)"
+
+    order_id = await db.create_order(
+        user_id=referrer_id,
+        username=callback.from_user.username or "",
+        full_name=callback.from_user.full_name,
+        plan_id=0,
+        plan_name=plan_name,
+        price=0,
+    )
+    await db.set_order_status(order_id, "pending")
+
+    await callback.message.edit_text(
+        f"🎉 درخواست هدیه شما (سرویس گیمینگ {reward_volume} گیگ) ثبت شد.\n"
+        f"به‌زودی توسط ادمین بررسی و تحویل داده میشه."
+    )
+    await callback.answer()
+
+    caption = (
+        f"🎁 درخواست هدیه رفرال - سفارش #{order_id}\n"
+        f"👤 کاربر: {callback.from_user.full_name} (@{callback.from_user.username or '-'})\n"
+        f"🆔 آیدی عددی: {referrer_id}\n"
+        f"📦 پلن: {plan_name}\n"
+        f"💰 مبلغ: رایگان (هدیه رفرال)"
+    )
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, caption, reply_markup=admin_decision_kb(order_id))
+        except Exception as e:
+            logging.warning(f"Could not notify admin {admin_id}: {e}")
 
 
 # ---------- Admin: management panel ----------
-def admin_menu_kb(role: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="👥 کاربران", callback_data="ausers:page:0")]]
-    if role in ("owner", "manager"):
-        rows.append([InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons")])
-    if role == "owner":
-        rows += [
-            [InlineKeyboardButton(text="📢 ارسال پیام همگانی", callback_data="adminbroadcast")],
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [InlineKeyboardButton(text="🎮 تعرفه‌های گیمینگ", callback_data="admintariff:gaming")],
             [InlineKeyboardButton(text="🌍 تعرفه‌های مولتی لوکیشن", callback_data="admintariff:multi")],
             [InlineKeyboardButton(text="✉️ پیام خوش‌آمدگویی", callback_data="adminwelcome")],
-            [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules")],
             [InlineKeyboardButton(text="🤝 تنظیمات رفرال", callback_data="adminreferral")],
-            [InlineKeyboardButton(text="💳 تخفیف شارژ کیف پول", callback_data="adminwalletbonus")],
-            [InlineKeyboardButton(text="📦 بکاپ / ریستور دیتابیس", callback_data="adminbackup")],
-            [InlineKeyboardButton(text="👮 مدیریت ادمین‌ها", callback_data="adminmanage")],
+            [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
         ]
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    )
 
 
 async def gaming_admin_list_kb() -> InlineKeyboardMarkup:
@@ -1084,120 +648,19 @@ ADMIN_ROOT_TEXT = "⚙️ <b>مدیریت ربات</b>\nچی رو می‌خوا�
 @dp.message(Command("admin"))
 @dp.message(F.text == "🛠 مدیریت ربات")
 async def admin_panel_entry(message: Message, state: FSMContext):
-    role = await get_admin_role(message.from_user.id)
-    if role is None:
-        return
-    await state.clear()
-    await message.answer(ADMIN_ROOT_TEXT, parse_mode="HTML", reply_markup=admin_menu_kb(role))
-
-
-# ---------- Admin: پشتیبان‌گیری و بازگردانی دیتابیس (برای جابه‌جایی بین اکانت‌های هاست) ----------
-def backup_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📥 دریافت فایل بکاپ", callback_data="dobackup")],
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")],
-        ]
-    )
-
-
-BACKUP_TEXT = (
-    "📦 <b>بکاپ / ریستور دیتابیس</b>\n\n"
-    "با «📥 دریافت فایل بکاپ» یک فایل از کل دیتابیس فعلی (کاربران، سفارش‌ها، کیف پول‌ها، تنظیمات) "
-    "براتون ارسال میشه.\n\n"
-    "برای <b>بازگردانی</b> دیتابیس (مثلاً روی اکانت/هاست جدید): همون فایل بکاپ رو برای همین ربات "
-    "بفرستید و روی همون فایل <b>ریپلای</b> کنید و دستور /restore رو بزنید "
-    "(یا موقع ارسال فایل، توی کپشن /restore بنویسید).\n\n"
-    "⚠️ بعد از ریستور، حتماً ربات رو یک‌بار ری‌استارت/Redeploy کنید."
-)
-
-
-@dp.callback_query(F.data == "adminbackup")
-async def admin_backup_menu(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.clear()
-    await callback.message.edit_text(BACKUP_TEXT, parse_mode="HTML", reply_markup=backup_menu_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "dobackup")
-async def admin_do_backup(callback: CallbackQuery):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await callback.answer()
-    if not os.path.exists(config.DB_PATH):
-        await callback.message.answer("❌ فایل دیتابیس پیدا نشد. مسیر DB_PATH رو چک کنید.")
-        return
-    await callback.message.answer_document(
-        FSInputFile(config.DB_PATH),
-        caption=(
-            "📦 این فایل، دیتابیس فعلی رباته.\n\n"
-            "برای بازگردانی روی ربات/اکانت جدید: این فایل رو برای اون ربات بفرستید، "
-            "روی خود فایل ریپلای کنید و دستور /restore رو بزنید."
-        ),
-    )
-
-
-@dp.message(Command("backup"))
-async def cmd_backup(message: Message):
     if message.from_user.id not in config.ADMIN_IDS:
         return
-    if not os.path.exists(config.DB_PATH):
-        await message.answer("❌ فایل دیتابیس پیدا نشد. مسیر DB_PATH رو چک کنید.")
-        return
-    await message.answer_document(
-        FSInputFile(config.DB_PATH),
-        caption="📦 فایل دیتابیس فعلی. برای بازگردانی، روی این فایل ریپلای کنید و /restore بزنید.",
-    )
-
-
-@dp.message(Command("restore"))
-async def cmd_restore(message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-
-    doc = None
-    if message.document:
-        doc = message.document
-    elif message.reply_to_message and message.reply_to_message.document:
-        doc = message.reply_to_message.document
-
-    if not doc:
-        await message.answer(
-            "⚠️ یک فایل دیتابیس (.db) رو همراه دستور /restore بفرستید، "
-            "یا روی فایلی که قبلاً فرستادید ریپلای کنید و /restore رو بزنید."
-        )
-        return
-
-    await message.answer("⏳ در حال بازگردانی دیتابیس...")
-
-    file_info = await bot.get_file(doc.file_id)
-
-    # از دیتابیس فعلی (در صورت وجود) یک نسخه پشتیبان محلی می‌گیریم
-    if os.path.exists(config.DB_PATH):
-        os.replace(config.DB_PATH, config.DB_PATH + ".bak")
-
-    os.makedirs(os.path.dirname(config.DB_PATH) or ".", exist_ok=True)
-    await bot.download_file(file_info.file_path, destination=config.DB_PATH)
-
-    await message.answer(
-        "✅ دیتابیس با موفقیت جایگزین شد.\n\n"
-        "⚠️ حالا حتماً ربات رو یک‌بار ری‌استارت (Redeploy در Railway) کنید تا اتصال به دیتابیس "
-        "جدید از نو برقرار بشه؛ در غیر این صورت ربات همچنان با اتصال قبلی کار می‌کنه."
-    )
+    await state.clear()
+    await message.answer(ADMIN_ROOT_TEXT, parse_mode="HTML", reply_markup=admin_menu_kb())
 
 
 @dp.callback_query(F.data == "admintariff:root")
 async def admintariff_root(callback: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(callback.from_user.id)
-    if role is None:
+    if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
     await state.clear()
-    await callback.message.edit_text(ADMIN_ROOT_TEXT, parse_mode="HTML", reply_markup=admin_menu_kb(role))
+    await callback.message.edit_text(ADMIN_ROOT_TEXT, parse_mode="HTML", reply_markup=admin_menu_kb())
     await callback.answer()
 
 
@@ -1237,39 +700,11 @@ async def save_welcome_message(message: Message, state: FSMContext):
     await message.answer("✅ پیام خوش‌آمدگویی با موفقیت بروزرسانی شد.", reply_markup=admin_menu_kb())
 
 
-@dp.callback_query(F.data == "adminrules")
-async def admin_edit_rules(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    current = await db.get_rules_text()
-    current_display = current if current else f"(پیش‌فرض)\n\n{DEFAULT_RULES_TEXT}"
-    await state.set_state(AdminStates.editing_rules_text)
-    await callback.message.edit_text(
-        f"📜 <b>قوانین فعلی:</b>\n\n{current_display}\n\n"
-        f"—————————————\n"
-        f"متن جدید قوانین رو بفرستید (تگ‌های ساده HTML مثل &lt;b&gt; پشتیبانی میشه):",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_root_kb,
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_rules_text)
-async def save_rules_text(message: Message, state: FSMContext):
-    text = message.text or message.caption
-    if not text:
-        await message.answer("لطفاً یه پیام متنی معتبر بفرستید.")
-        return
-    await db.set_rules_text(text)
-    await state.clear()
-    await message.answer("✅ قوانین با موفقیت بروزرسانی شد.", reply_markup=admin_menu_kb())
-
-
 def referral_settings_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ تغییر درصد پورسانتی", callback_data="editrefpercent")],
+            [InlineKeyboardButton(text="✏️ تغییر تعداد دعوت لازم", callback_data="editrefcount")],
+            [InlineKeyboardButton(text="✏️ تغییر حجم هدیه (گیگ)", callback_data="editrefvolume")],
             [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")],
         ]
     )
@@ -1281,760 +716,64 @@ async def admin_referral_settings(callback: CallbackQuery, state: FSMContext):
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
     await state.clear()
-    percent = await db.get_referral_commission_percent()
+    required_count = await db.get_referral_required_count()
+    reward_volume = await db.get_referral_reward_volume()
     await callback.message.edit_text(
-        f"🤝 <b>تنظیمات رفرال (پورسانتی دائمی)</b>\n\n"
-        f"💸 درصد پورسانتی فعلی: <b>{percent}٪</b>\n\n"
-        f"به‌ازای هر خرید موفق (تحویل‌شده) هر کاربری که با لینک یه نفر وارد ربات شده، همین درصد از مبلغ خرید بلافاصله و به‌صورت نقدی به کیف پول دعوت‌کننده اضافه میشه — برای همیشه و بدون محدودیت تعداد دفعات.",
+        f"🤝 <b>تنظیمات رفرال</b>\n\n"
+        f"👥 تعداد دعوت موفق لازم: <b>{required_count}</b>\n"
+        f"🎁 حجم هدیه گیمینگ: <b>{reward_volume} گیگ</b>",
         parse_mode="HTML",
         reply_markup=referral_settings_kb(),
     )
     await callback.answer()
 
 
-@dp.callback_query(F.data == "editrefpercent")
-async def start_edit_referral_percent(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "editrefcount")
+async def start_edit_referral_count(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
-    await state.set_state(AdminStates.editing_referral_percent)
+    await state.set_state(AdminStates.editing_referral_count)
     await callback.message.edit_text(
-        "درصد پورسانتی رفرال رو وارد کنید (عدد بین ۱ تا ۱۰۰، مثال: 10):",
+        "تعداد دعوت موفق لازم برای دریافت هدیه رو بفرستید (فقط عدد):",
         reply_markup=back_to_admin_root_kb,
     )
     await callback.answer()
 
 
-@dp.message(AdminStates.editing_referral_percent)
-async def save_referral_percent(message: Message, state: FSMContext):
+@dp.message(AdminStates.editing_referral_count)
+async def save_referral_count(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if not text.isdigit() or not (1 <= int(text) <= 100):
-        await message.answer("لطفاً یه عدد صحیح بین ۱ تا ۱۰۰ بفرستید (مثال: 10)")
-        return
-    await db.set_setting("referral_commission_percent", int(text))
-    await state.clear()
-    await message.answer("✅ درصد پورسانتی رفرال با موفقیت بروزرسانی شد.", reply_markup=referral_settings_kb())
-
-
-# ---------- Admin: کد تخفیف ----------
-async def coupons_admin_kb() -> InlineKeyboardMarkup:
-    coupons = await db.list_coupons()
-    rows = []
-    for c in coupons:
-        status = "✅" if c["active"] else "🚫"
-        usage = f"{c['used_count']}/{c['max_uses']}" if c["max_uses"] is not None else f"{c['used_count']}/∞"
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{status} {c['code']} - {c['percent']}٪ ({usage})",
-                    callback_data=f"coupontoggle:{c['code']}",
-                ),
-                InlineKeyboardButton(text="🗑", callback_data=f"coupondelete:{c['code']}"),
-            ]
-        )
-    rows.append([InlineKeyboardButton(text="➕ ساخت کد تخفیف جدید", callback_data="coupadd")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "admincoupons")
-async def admin_coupons_root(callback: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(callback.from_user.id)
-    if not await can_manage_coupons(role):
-        await callback.answer("شما دسترسی به این بخش رو ندارید.", show_alert=True)
-        return
-    await state.clear()
-    await callback.message.edit_text(
-        "🎟 <b>کدهای تخفیف</b>\nروی هر کد بزنید تا فعال/غیرفعال بشه، یا با 🗑 حذفش کنید.",
-        parse_mode="HTML",
-        reply_markup=await coupons_admin_kb(),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("coupontoggle:"))
-async def toggle_coupon(callback: CallbackQuery):
-    role = await get_admin_role(callback.from_user.id)
-    if not await can_manage_coupons(role):
-        await callback.answer("شما دسترسی به این بخش رو ندارید.", show_alert=True)
-        return
-    code = callback.data.split(":", 1)[1]
-    await db.toggle_coupon_active(code)
-    await callback.message.edit_text(
-        "🎟 <b>کدهای تخفیف</b>\nروی هر کد بزنید تا فعال/غیرفعال بشه، یا با 🗑 حذفش کنید.",
-        parse_mode="HTML",
-        reply_markup=await coupons_admin_kb(),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("coupondelete:"))
-async def delete_coupon_handler(callback: CallbackQuery):
-    role = await get_admin_role(callback.from_user.id)
-    if not await can_manage_coupons(role):
-        await callback.answer("شما دسترسی به این بخش رو ندارید.", show_alert=True)
-        return
-    code = callback.data.split(":", 1)[1]
-    await db.delete_coupon(code)
-    await callback.message.edit_text(
-        "🎟 <b>کدهای تخفیف</b>\nروی هر کد بزنید تا فعال/غیرفعال بشه، یا با 🗑 حذفش کنید.",
-        parse_mode="HTML",
-        reply_markup=await coupons_admin_kb(),
-    )
-    await callback.answer("کد تخفیف حذف شد.")
-
-
-@dp.callback_query(F.data == "coupadd")
-async def start_add_coupon(callback: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(callback.from_user.id)
-    if not await can_manage_coupons(role):
-        await callback.answer("شما دسترسی به این بخش رو ندارید.", show_alert=True)
-        return
-    await state.set_state(AdminStates.adding_coupon_code)
-    await callback.message.edit_text(
-        "کد تخفیف رو وارد کنید (فقط حروف انگلیسی و عدد، بدون فاصله - مثال: SUMMER20):",
-        reply_markup=back_to_admin_root_kb,
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.adding_coupon_code)
-async def add_coupon_step_code(message: Message, state: FSMContext):
-    code = (message.text or "").strip().upper()
-    if not code.isalnum():
-        await message.answer("کد باید فقط شامل حروف انگلیسی و عدد باشه، بدون فاصله یا کاراکتر خاص. دوباره امتحان کنید:")
-        return
-    existing = await db.get_coupon(code)
-    if existing:
-        await message.answer("این کد قبلاً ثبت شده. یه کد دیگه انتخاب کنید:")
-        return
-    await state.update_data(coupon_code=code)
-    await state.set_state(AdminStates.adding_coupon_percent)
-    await message.answer("چند درصد تخفیف بده؟ (عدد بین ۱ تا ۱۰۰):")
-
-
-@dp.message(AdminStates.adding_coupon_percent)
-async def add_coupon_step_percent(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if not text.isdigit() or not (1 <= int(text) <= 100):
-        await message.answer("لطفاً یه عدد صحیح بین ۱ تا ۱۰۰ بفرستید:")
-        return
-    await state.update_data(coupon_percent=int(text))
-    await state.set_state(AdminStates.adding_coupon_maxuses)
-    await message.answer("حداکثر تعداد استفاده از این کد چقدر باشه؟ (برای نامحدود، عدد 0 رو بفرستید):")
-
-
-@dp.message(AdminStates.adding_coupon_maxuses)
-async def add_coupon_step_maxuses(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("لطفاً فقط عدد بفرستید (برای نامحدود، 0 رو بفرستید):")
-        return
-    max_uses = int(text) if int(text) > 0 else None
-
-    data = await state.get_data()
-    code = data.get("coupon_code")
-    percent = data.get("coupon_percent")
-    await db.create_coupon(code, percent, max_uses)
-    await state.clear()
-
-    usage_text = f"{max_uses} بار" if max_uses else "نامحدود"
-    await message.answer(
-        f"✅ کد تخفیف <b>{code}</b> با {percent}٪ تخفیف و ظرفیت {usage_text} ساخته شد.",
-        parse_mode="HTML",
-        reply_markup=await coupons_admin_kb(),
-    )
-
-
-# ---------- Admin: تخفیف پلکانی شارژ کیف پول ----------
-def wallet_bonus_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ تغییر آستانه مبلغ", callback_data="editwalletthreshold")],
-            [InlineKeyboardButton(text="✏️ تغییر درصد هدیه", callback_data="editwalletbonuspercent")],
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")],
-        ]
-    )
-
-
-@dp.callback_query(F.data == "adminwalletbonus")
-async def admin_wallet_bonus_settings(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.clear()
-    threshold = await db.get_wallet_bonus_threshold()
-    percent = await db.get_wallet_bonus_percent()
-    await callback.message.edit_text(
-        f"💳 <b>تخفیف پلکانی شارژ کیف پول</b>\n\n"
-        f"📊 آستانه فعلی: <b>{threshold:,} تومان</b>\n"
-        f"🎁 درصد هدیه: <b>{percent}٪</b>\n\n"
-        f"یعنی وقتی کاربری {threshold:,} تومان یا بیشتر شارژ کنه، {percent}٪ هدیه اضافه هم به کیف پولش اضافه میشه.",
-        parse_mode="HTML",
-        reply_markup=wallet_bonus_kb(),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "editwalletthreshold")
-async def start_edit_wallet_threshold(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.set_state(AdminStates.editing_wallet_bonus_threshold)
-    await callback.message.edit_text(
-        "حداقل مبلغ شارژ برای دریافت هدیه رو به تومان وارد کنید (مثال: 500000):",
-        reply_markup=back_to_admin_root_kb,
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_wallet_bonus_threshold)
-async def save_wallet_threshold(message: Message, state: FSMContext):
-    text = (message.text or "").replace(",", "").strip()
     if not text.isdigit() or int(text) <= 0:
-        await message.answer("لطفاً یه عدد صحیح و بزرگ‌تر از صفر بفرستید (مثال: 500000)")
+        await message.answer("لطفاً یه عدد صحیح و بزرگ‌تر از صفر بفرستید (مثال: 3)")
         return
-    await db.set_setting("wallet_bonus_threshold", int(text))
+    await db.set_setting("referral_required_count", int(text))
     await state.clear()
-    await message.answer("✅ آستانه مبلغ با موفقیت بروزرسانی شد.", reply_markup=wallet_bonus_kb())
+    await message.answer("✅ تعداد دعوت لازم با موفقیت بروزرسانی شد.", reply_markup=referral_settings_kb())
 
 
-@dp.callback_query(F.data == "editwalletbonuspercent")
-async def start_edit_wallet_bonus_percent(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "editrefvolume")
+async def start_edit_referral_volume(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
-    await state.set_state(AdminStates.editing_wallet_bonus_percent)
+    await state.set_state(AdminStates.editing_referral_volume)
     await callback.message.edit_text(
-        "درصد هدیه رو وارد کنید (عدد بین ۱ تا ۱۰۰، مثال: 5):",
+        "حجم هدیه گیمینگ رو به گیگابایت بفرستید (فقط عدد):",
         reply_markup=back_to_admin_root_kb,
     )
     await callback.answer()
 
 
-@dp.message(AdminStates.editing_wallet_bonus_percent)
-async def save_wallet_bonus_percent(message: Message, state: FSMContext):
+@dp.message(AdminStates.editing_referral_volume)
+async def save_referral_volume(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if not text.isdigit() or not (1 <= int(text) <= 100):
-        await message.answer("لطفاً یه عدد صحیح بین ۱ تا ۱۰۰ بفرستید (مثال: 5)")
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("لطفاً یه عدد صحیح و بزرگ‌تر از صفر بفرستید (مثال: 50)")
         return
-    await db.set_setting("wallet_bonus_percent", int(text))
+    await db.set_setting("referral_reward_volume", int(text))
     await state.clear()
-    await message.answer("✅ درصد هدیه با موفقیت بروزرسانی شد.", reply_markup=wallet_bonus_kb())
-
-
-# ---------- Admin: ارسال پیام همگانی (اطلاعیه/تبلیغ به سبک کانال) ----------
-@dp.callback_query(F.data == "adminbroadcast")
-async def admin_broadcast_prompt(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.set_state(AdminStates.broadcasting_message)
-    await callback.message.edit_text(
-        "📢 <b>ارسال پیام همگانی</b>\n\n"
-        "هر نوع پیامی که می‌خواید (متن، عکس، ویدیو، فایل، صوت و...) رو همینجا بفرستید؛ "
-        "دقیقاً همون‌طور که فرستادید (بدون تگ Forwarded، مثل کانال) برای همه‌ی کاربرانی که "
-        "ربات رو استارت کردن ارسال میشه.\n\n"
-        "⚠️ فقط یه پیام تکی بفرستید (نه آلبوم چند عکسی).",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_root_kb,
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.broadcasting_message)
-async def admin_broadcast_receive(message: Message, state: FSMContext):
-    await state.update_data(broadcast_chat_id=message.chat.id, broadcast_message_id=message.message_id)
-    await state.set_state(None)
-    total = await db.count_users()
-    await message.answer(
-        f"👆 پیام بالا دقیقاً همینطوری برای <b>{total:,}</b> کاربر ربات ارسال میشه.\n\nمطمئنید؟",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"✅ ارسال به همه ({total:,} نفر)", callback_data="broadcastsend")],
-                [InlineKeyboardButton(text="❌ انصراف", callback_data="admintariff:root")],
-            ]
-        ),
-    )
-
-
-@dp.callback_query(F.data == "broadcastsend")
-async def admin_broadcast_send(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-
-    data = await state.get_data()
-    src_chat_id = data.get("broadcast_chat_id")
-    src_message_id = data.get("broadcast_message_id")
-    if not src_chat_id or not src_message_id:
-        await callback.answer("پیامی برای ارسال پیدا نشد. دوباره از منوی «📢 ارسال پیام همگانی» شروع کنید.", show_alert=True)
-        return
-
-    await callback.answer()
-    await callback.message.edit_text("⏳ در حال ارسال پیام برای همه‌ی کاربران... این ممکنه چند دقیقه طول بکشه.")
-
-    user_ids = await db.get_all_user_ids()
-    sent = 0
-    failed = 0
-
-    for i, uid in enumerate(user_ids, start=1):
-        try:
-            await bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id)
-            sent += 1
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            try:
-                await bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id)
-                sent += 1
-            except Exception:
-                failed += 1
-        except (TelegramForbiddenError, TelegramBadRequest):
-            failed += 1  # کاربر ربات رو بلاک کرده یا چت باهاش وجود نداره
-        except Exception:
-            failed += 1
-
-        await asyncio.sleep(0.05)  # جلوگیری از برخورد با محدودیت نرخ ارسال تلگرام
-
-        if i % 50 == 0:
-            try:
-                await callback.message.edit_text(
-                    f"⏳ در حال ارسال... {i:,}/{len(user_ids):,}\n📤 موفق: {sent:,} | 🚫 ناموفق: {failed:,}"
-                )
-            except Exception:
-                pass
-
-    await callback.message.answer(
-        f"✅ <b>ارسال پیام همگانی تموم شد.</b>\n\n"
-        f"📤 ارسال موفق: <b>{sent:,}</b>\n"
-        f"🚫 ناموفق (بلاک کرده یا ربات رو حذف کرده): <b>{failed:,}</b>",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_root_kb,
-    )
-
-
-# ---------- Admin: مدیریت ادمین‌ها (فقط مالک ربات) ----------
-async def build_admins_list_text_kb():
-    managed = await db.list_admins()
-    if not managed:
-        text = "👮 <b>مدیریت ادمین‌ها</b>\nهنوز هیچ ادمین مدیریت‌شده‌ای اضافه نکردید."
-    else:
-        lines = ["👮 <b>مدیریت ادمین‌ها</b>\n"]
-        for a in managed:
-            label = f"@{a['username']}" if a["username"] else (a["full_name"] or "بدون‌نام")
-            role_label = ADMIN_ROLE_LABELS.get(a["role"], a["role"])
-            lines.append(f"• {label} | <code>{a['user_id']}</code> — {role_label}")
-        text = "\n".join(lines)
-
-    rows = []
-    for a in managed:
-        label = f"@{a['username']}" if a["username"] else (a["full_name"] or str(a["user_id"]))
-        rows.append(
-            [InlineKeyboardButton(text=f"🗑 حذف {label}", callback_data=f"adminremove:{a['user_id']}")]
-        )
-    rows.append([InlineKeyboardButton(text="➕ افزودن ادمین جدید", callback_data="adminaddadmin")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "adminmanage")
-async def admin_manage_root(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("این بخش فقط برای مالک ربات در دسترسه.", show_alert=True)
-        return
-    await state.clear()
-    text, kb = await build_admins_list_text_kb()
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "adminaddadmin")
-async def admin_add_admin_prompt(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("این بخش فقط برای مالک ربات در دسترسه.", show_alert=True)
-        return
-    await state.set_state(AdminStates.adding_admin_id)
-    await callback.message.edit_text(
-        "🆔 آیدی عددی کاربری که می‌خواید ادمین کنید رو بفرستید.\n"
-        "(کاربر باید حداقل یه‌بار ربات رو استارت کرده باشه.)",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 انصراف", callback_data="adminmanage")]]
-        ),
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.adding_admin_id)
-async def admin_add_admin_receive_id(message: Message, state: FSMContext):
-    if message.from_user.id not in config.ADMIN_IDS:
-        await state.set_state(None)
-        return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("لطفاً فقط آیدی عددی کاربر رو بفرستید:")
-        return
-    user_id = int(text)
-
-    if user_id in config.ADMIN_IDS:
-        await message.answer("این کاربر از قبل مالک رباته و نیازی به این کار نیست.")
-        return
-
-    existing_role = await db.get_admin_role(user_id)
-    user = await db.get_user(user_id)
-    if not user:
-        await message.answer(
-            "⚠️ این کاربر هیچ‌وقت ربات رو استارت نکرده، پس نمی‌تونم مشخصاتش رو نشون بدم. "
-            "اگه مطمئنید آیدی درسته، بازم می‌تونید ادامه بدید."
-        )
-
-    await state.update_data(new_admin_user_id=user_id)
-    await state.set_state(None)
-
-    note = f"\n(در حال حاضر: {ADMIN_ROLE_LABELS.get(existing_role, existing_role)})" if existing_role else ""
-    await message.answer(
-        f"سطح دسترسی این ادمین رو انتخاب کنید:{note}",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🥉 سطح ۱ - فقط کاربران", callback_data=f"adminsetrole:{user_id}:support")],
-                [
-                    InlineKeyboardButton(
-                        text="🥈 سطح ۲ - کاربران + کدهای تخفیف", callback_data=f"adminsetrole:{user_id}:manager"
-                    )
-                ],
-                [InlineKeyboardButton(text="🔙 انصراف", callback_data="adminmanage")],
-            ]
-        ),
-    )
-
-
-@dp.callback_query(F.data.startswith("adminsetrole:"))
-async def admin_set_role(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("این بخش فقط برای مالک ربات در دسترسه.", show_alert=True)
-        return
-    _, user_id_str, role = callback.data.split(":", 2)
-    user_id = int(user_id_str)
-    if role not in ("support", "manager"):
-        await callback.answer("سطح نامعتبر.", show_alert=True)
-        return
-
-    await db.add_admin(user_id, role, added_by=callback.from_user.id)
-
-    role_label = ADMIN_ROLE_LABELS.get(role, role)
-    try:
-        await bot.send_message(
-            user_id,
-            f"🎉 شما به عنوان «{role_label}» به تیم مدیریت ربات اضافه شدید.\n"
-            f"برای ورود به پنل مدیریت، از منو روی «🛠 مدیریت ربات» بزنید.",
-        )
-    except Exception as e:
-        logging.warning(f"Could not notify new admin {user_id}: {e}")
-
-    text, kb = await build_admins_list_text_kb()
-    await callback.message.edit_text(
-        f"✅ کاربر <code>{user_id}</code> با نقش «{role_label}» اضافه شد.\n\n" + text,
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("adminremove:"))
-async def admin_remove_admin(callback: CallbackQuery):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("این بخش فقط برای مالک ربات در دسترسه.", show_alert=True)
-        return
-    user_id = int(callback.data.split(":", 1)[1])
-    await db.remove_admin(user_id)
-    try:
-        await bot.send_message(user_id, "🚫 دسترسی ادمین شما به ربات لغو شد.")
-    except Exception:
-        pass
-    text, kb = await build_admins_list_text_kb()
-    await callback.message.edit_text(f"🗑 ادمین حذف شد.\n\n" + text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
-
-
-# ---------- Admin: بخش کاربران (فقط ادمین) ----------
-USERS_PAGE_SIZE = 8
-
-
-def user_row_label(u) -> str:
-    name = f"@{u['username']}" if u["username"] else (u["full_name"] or "بدون‌نام")
-    return f"{name} | {u['user_id']}"
-
-
-async def build_users_page(page: int):
-    total = await db.count_users()
-    users = await db.list_users(limit=USERS_PAGE_SIZE, offset=page * USERS_PAGE_SIZE)
-
-    if total == 0:
-        text = "👥 <b>کاربران ربات</b>\nهنوز هیچ کاربری ربات رو استارت نکرده."
-    else:
-        text = (
-            f"👥 <b>کاربران ربات</b>\n"
-            f"تعداد کل: <b>{total:,}</b> نفر\n\n"
-            f"روی هر کاربر بزنید تا مشخصاتش رو ببینید:"
-        )
-
-    rows = [
-        [InlineKeyboardButton(text=user_row_label(u), callback_data=f"auser:{u['user_id']}:p{page}")]
-        for u in users
-    ]
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"ausers:page:{page - 1}"))
-    if (page + 1) * USERS_PAGE_SIZE < total:
-        nav.append(InlineKeyboardButton(text="بعدی ➡️", callback_data=f"ausers:page:{page + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🔎 جست‌وجوی کاربر", callback_data="ausersearch")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def build_user_search_results(query: str):
-    users = await db.search_users(query, limit=30)
-    rows = [
-        [InlineKeyboardButton(text=user_row_label(u), callback_data=f"auser:{u['user_id']}:s")]
-        for u in users
-    ]
-    rows.append([InlineKeyboardButton(text="🔎 جست‌وجوی دوباره", callback_data="ausersearch")])
-    rows.append([InlineKeyboardButton(text="📋 نمایش همه کاربران", callback_data="ausers:page:0")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
-
-    safe_query = html.escape(query)
-    if users:
-        text = f"🔎 <b>نتایج جست‌وجو برای:</b> <code>{safe_query}</code>\nتعداد نتایج: {len(users)}"
-    else:
-        text = f"🔎 <b>نتایج جست‌وجو برای:</b> <code>{safe_query}</code>\nهیچ کاربری پیدا نشد."
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _row_get(row, key: str, default=None):
-    """دسترسی امن به یه ستون از sqlite Row؛ اگه ستون وجود نداشته باشه (دیتابیس قدیمی) خطا نمی‌ده."""
-    try:
-        return row[key]
-    except (IndexError, KeyError):
-        return default
-
-
-def user_detail_text(user, wallet_balance: int, orders_count: int) -> str:
-    username_val = _row_get(user, "username")
-    full_name_val = _row_get(user, "full_name")
-    username = f"@{html.escape(username_val)}" if username_val else "—"
-    full_name = html.escape(full_name_val) if full_name_val else "—"
-    joined = (_row_get(user, "joined_at") or "")[:19].replace("T", " ") or "—"
-    last_seen = (_row_get(user, "last_seen") or "")[:19].replace("T", " ") or "—"
-    return (
-        f"👤 <b>مشخصات کاربر</b>\n"
-        f"—————————————\n"
-        f"🆔 آیدی عددی: <code>{user['user_id']}</code>\n"
-        f"🔖 یوزرنیم: {username}\n"
-        f"📝 نام: {full_name}\n"
-        f"💰 موجودی کیف پول: <b>{wallet_balance:,} تومان</b>\n"
-        f"📦 تعداد سفارش‌ها: <b>{orders_count}</b>\n"
-        f"🗓 اولین ورود: {joined}\n"
-        f"🕒 آخرین فعالیت: {last_seen}"
-    )
-
-
-def user_detail_kb(user_id: int, ctx: str, role: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="🧾 سفارش‌های این کاربر", callback_data=f"auserorders:{user_id}:{ctx}")]]
-    if role == "owner":
-        rows.append(
-            [InlineKeyboardButton(text="✏️ ویرایش موجودی کیف پول", callback_data=f"auserwallet:{user_id}:{ctx}")]
-        )
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data=f"auserback:{ctx}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_user_orders_kb(orders, user_id: int, ctx: str) -> InlineKeyboardMarkup:
-    rows = []
-    for o in orders:
-        icon = ORDER_STATUS_ICON.get(o["status"], "•")
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{icon} #{o['id']} - {o['plan_name']} - {o['price']:,} تومان",
-                    callback_data=f"auserorder:{o['id']}:{user_id}:{ctx}",
-                )
-            ]
-        )
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت به مشخصات کاربر", callback_data=f"auser:{user_id}:{ctx}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data.startswith("ausers:page:"))
-async def admin_users_page(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    page = int(callback.data.split(":")[2])
-    text, kb = await build_users_page(page)
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "ausersearch")
-async def admin_users_search_prompt(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.set_state(AdminStates.searching_users)
-    await callback.message.edit_text(
-        "🔎 آیدی عددی یا بخشی از یوزرنیم کاربر مورد نظر رو ارسال کنید:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data="ausers:page:0")]]
-        ),
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.searching_users)
-async def admin_users_search_result(message: Message, state: FSMContext):
-    query = (message.text or "").strip()
-    if not query:
-        await message.answer("لطفاً یه آیدی عددی یا بخشی از یوزرنیم بفرستید:")
-        return
-    await state.update_data(last_user_search=query)
-    await state.set_state(None)  # استیت رو خالی می‌کنیم ولی last_user_search رو نگه می‌داریم
-    text, kb = await build_user_search_results(query)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("auserback:"))
-async def admin_users_back(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    ctx = callback.data.split(":", 1)[1]
-    if ctx == "s":
-        data = await state.get_data()
-        query = data.get("last_user_search")
-        if query:
-            text, kb = await build_user_search_results(query)
-        else:
-            text, kb = await build_users_page(0)
-    else:
-        page = int(ctx[1:]) if ctx.startswith("p") and ctx[1:].isdigit() else 0
-        text, kb = await build_users_page(page)
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("auser:"))
-async def admin_view_user(callback: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(callback.from_user.id)
-    if role is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    _, user_id_str, ctx = callback.data.split(":", 2)
-    user_id = int(user_id_str)
-    user = await db.get_user(user_id)
-    if not user:
-        await callback.answer("این کاربر پیدا نشد.", show_alert=True)
-        return
-    wallet_balance = await db.get_wallet_balance(user_id)
-    orders = await db.get_user_orders(user_id)
-    text = user_detail_text(user, wallet_balance, len(orders))
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=user_detail_kb(user_id, ctx, role))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("auserorders:"))
-async def admin_user_orders(callback: CallbackQuery):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    _, user_id_str, ctx = callback.data.split(":", 2)
-    user_id = int(user_id_str)
-    orders = await db.get_user_orders(user_id)
-    if not orders:
-        await callback.answer("این کاربر هنوز هیچ سفارشی ثبت نکرده.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "🧾 <b>سفارش‌های این کاربر</b>\nروی هر سفارش بزنید تا جزئیاتش رو ببینید:",
-        parse_mode="HTML",
-        reply_markup=admin_user_orders_kb(orders, user_id, ctx),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("auserorder:"))
-async def admin_view_user_order(callback: CallbackQuery):
-    if await get_admin_role(callback.from_user.id) is None:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    _, order_id_str, user_id_str, ctx = callback.data.split(":", 3)
-    order_id = int(order_id_str)
-    user_id = int(user_id_str)
-    order = await db.get_order(order_id)
-    if not order:
-        await callback.answer("این سفارش پیدا نشد.", show_alert=True)
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 بازگشت به لیست سفارش‌ها", callback_data=f"auserorders:{user_id}:{ctx}")]
-        ]
-    )
-    await callback.message.edit_text(order_detail_text(order), parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("auserwallet:"))
-async def admin_edit_user_wallet_prompt(callback: CallbackQuery, state: FSMContext):
-    # عمداً محدود به مالک ربات: هیچ‌کدوم از سطوح ادمین مدیریت‌شده نباید بتونن دستی موجودی کیف پول اضافه کنن
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("این قابلیت فقط برای مالک ربات در دسترسه.", show_alert=True)
-        return
-    _, user_id_str, ctx = callback.data.split(":", 2)
-    user_id = int(user_id_str)
-    current = await db.get_wallet_balance(user_id)
-    await state.update_data(edit_wallet_user_id=user_id, edit_wallet_ctx=ctx)
-    await state.set_state(AdminStates.editing_wallet_balance)
-    await callback.message.edit_text(
-        f"💰 موجودی فعلی این کاربر: <b>{current:,} تومان</b>\nموجودی جدید رو به تومان وارد کنید:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 انصراف", callback_data=f"auser:{user_id}:{ctx}")]]
-        ),
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_wallet_balance)
-async def admin_edit_user_wallet_save(message: Message, state: FSMContext):
-    # این استیت فقط از طریق admin_edit_user_wallet_prompt (که مخصوص مالک ربات هست) قابل‌دسترسیه
-    if message.from_user.id not in config.ADMIN_IDS:
-        await state.set_state(None)
-        return
-    text = (message.text or "").replace(",", "").strip()
-    if not text.isdigit():
-        await message.answer("لطفاً فقط عدد صحیح بفرستید (مثال: 100000):")
-        return
-
-    data = await state.get_data()
-    user_id = data.get("edit_wallet_user_id")
-    ctx = data.get("edit_wallet_ctx", "p0")
-    if user_id is None:
-        await state.set_state(None)
-        await message.answer("مشکلی پیش اومد، دوباره از بخش کاربران وارد شوید.")
-        return
-
-    await db.set_wallet_balance(user_id, int(text))
-    await state.set_state(None)  # last_user_search رو دست‌نخورده نگه می‌داریم
-
-    user = await db.get_user(user_id)
-    wallet_balance = await db.get_wallet_balance(user_id)
-    orders = await db.get_user_orders(user_id)
-    await message.answer(
-        "✅ موجودی کیف پول با موفقیت بروزرسانی شد.\n\n" + user_detail_text(user, wallet_balance, len(orders)),
-        parse_mode="HTML",
-        reply_markup=user_detail_kb(user_id, ctx, "owner"),
-    )
+    await message.answer("✅ حجم هدیه رفرال با موفقیت بروزرسانی شد.", reply_markup=referral_settings_kb())
 
 
 @dp.callback_query(F.data == "admintariff:gaming")
@@ -2218,7 +957,7 @@ async def add_multi_price(message: Message, state: FSMContext):
 # ---------- Admin handlers ----------
 @dp.callback_query(F.data.startswith("approve:"))
 async def admin_approve(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) is None:
+    if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
 
@@ -2263,32 +1002,29 @@ async def admin_send_panel_info(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ ارسال به کاربر ناموفق بود: {e}")
 
-    # رفرال دائمی پورسانتی: به‌ازای هر خرید موفق (تحویل‌شده) کاربری که با لینک یه نفر دیگه وارد شده،
-    # درصدی از مبلغ خرید به‌صورت نقدی به کیف پول دعوت‌کننده اضافه میشه - این کار به تعداد نامحدود تکرار میشه
+    # بررسی سیستم رفرال: اگر این کاربر با لینک دعوت وارد شده، این خرید رو "تبدیل‌شده" علامت بزن
     referral = await db.get_referral_by_referred(order["user_id"])
-    if referral:
-        if not referral["converted"]:
-            await db.mark_referral_converted(order["user_id"])
+    if referral and not referral["converted"]:
+        await db.mark_referral_converted(order["user_id"])
         referrer_id = referral["referrer_id"]
-        if order["price"] and order["price"] > 0:
-            commission_percent = await db.get_referral_commission_percent()
-            commission_amount = int(order["price"] * commission_percent / 100)
-            if commission_amount > 0:
-                await db.add_wallet_balance(referrer_id, commission_amount)
-                await db.add_referral_commission(referrer_id, order["user_id"], order_id, commission_amount)
-                try:
-                    await bot.send_message(
-                        referrer_id,
-                        f"💸 یکی از دوستانی که دعوت کردید خرید کرد!\n"
-                        f"مبلغ {commission_amount:,} تومان ({commission_percent}٪ از خریدش) به کیف پول شما اضافه شد. 🎉",
-                    )
-                except Exception as e:
-                    logging.warning(f"Could not notify referrer {referrer_id} about commission: {e}")
+        converted_count = await db.count_converted_referrals(referrer_id)
+        required_count = await db.get_referral_required_count()
+        reward_volume = await db.get_referral_reward_volume()
+        if converted_count == required_count and not await db.has_claimed_reward(referrer_id):
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 تبریک! {required_count} نفر از دوستان شما با لینک دعوتتون خرید کردن.\n"
+                    f"یک سرویس گیمینگ {reward_volume} گیگ رایگان بهتون تعلق گرفت 🎁\n"
+                    f"برای دریافت، به بخش «🤝 دعوت دوستان» برید و روی دکمه دریافت هدیه بزنید.",
+                )
+            except Exception as e:
+                logging.warning(f"Could not notify referrer {referrer_id} about reward: {e}")
 
 
 @dp.callback_query(F.data.startswith("reject:"))
 async def admin_reject(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) is None:
+    if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
 
@@ -2300,15 +1036,10 @@ async def admin_reject(callback: CallbackQuery, state: FSMContext):
 
     await db.set_order_status(order_id, "rejected")
 
-    refund_note = ""
-    if order["payment_method"] == "wallet" and order["price"] > 0:
-        await db.add_wallet_balance(order["user_id"], order["price"])
-        refund_note = f"\n💰 مبلغ {order['price']:,} تومان به کیف پول شما برگردونده شد."
-
     try:
         await bot.send_message(
             order["user_id"],
-            f"❌ متأسفانه سفارش شما (#{order_id}) رد شد.{refund_note}\n"
+            f"❌ متأسفانه سفارش شما (#{order_id}) رد شد.\n"
             f"در صورت وجود اشتباه در واریزی، لطفاً با پشتیبانی در ارتباط باشید.",
         )
     except Exception as e:
@@ -2320,30 +1051,13 @@ async def admin_reject(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(Command("orders_admin"))
 async def admin_all_pending(message: Message):
-    if await get_admin_role(message.from_user.id) is None:
+    if message.from_user.id not in config.ADMIN_IDS:
         return
     # نمایش سریع راهنما - برای گزارش کامل می‌تونید دیتابیس bot.db رو با ابزار SQLite باز کنید
     await message.answer(
         "برای مشاهده کامل سفارش‌ها فایل دیتابیس bot.db رو بررسی کنید، "
         "یا از دستورات تأیید/رد که زیر هر سفارش جدید ارسال میشه استفاده کنید."
     )
-
-
-# ---------- مدیریت خطاهای پیش‌بینی‌نشده ----------
-# بدون این هندلر، اگه توی یه هندلر خطایی رخ بده (مثلاً به‌خاطر HTML نامعتبر)، کاربر هیچ
-# واکنشی نمی‌بینه (نه پیام خطا، نه هیچی) و به نظر میاد ربات "هیچ کاری نکرده".
-@dp.errors()
-async def global_error_handler(event: ErrorEvent):
-    logging.exception("خطای پیش‌بینی‌نشده در پردازش آپدیت", exc_info=event.exception)
-    update = event.update
-    try:
-        if update.callback_query:
-            await update.callback_query.answer("⚠️ خطایی رخ داد. لطفاً دوباره امتحان کنید.", show_alert=True)
-        elif update.message:
-            await update.message.answer("⚠️ خطایی رخ داد. لطفاً دوباره امتحان کنید.")
-    except Exception:
-        pass  # اگه ارسال پیام خطا هم شکست خورد، دیگه کاری نمیشه کرد
-    return True
 
 
 # ---------- Startup ----------
