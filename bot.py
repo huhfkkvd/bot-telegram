@@ -61,93 +61,6 @@ dp.message.outer_middleware(ThrottlingMiddleware(rate_limit=0.7))
 dp.callback_query.outer_middleware(ThrottlingMiddleware(rate_limit=0.4))
 
 
-# ---------- عضویت اجباری در کانال ----------
-_membership_cache: dict[int, tuple[bool, float]] = {}
-MEMBERSHIP_CACHE_TTL = 60  # ثانیه - برای جلوگیری از فراخوانی زیاد Telegram API روی هر پیام/دکمه
-
-
-def _force_join_channel_username() -> str:
-    """یوزرنیم کانال اجباری رو نرمالایز می‌کنه (با @ در ابتدا)، یا رشته خالی اگه قابلیت غیرفعال باشه."""
-    ch = (config.FORCE_JOIN_CHANNEL or "").strip()
-    if not ch:
-        return ""
-    return ch if ch.startswith("@") else f"@{ch}"
-
-
-async def is_channel_member(user_id: int) -> bool:
-    """چک می‌کنه کاربر عضو کانال اجباریه یا نه.
-    اگه قابلیت غیرفعال باشه یا خطایی پیش بیاد (مثلاً ربات ادمین کانال نیست)، True برمی‌گردونه
-    تا در صورت تنظیم نادرست، کل ربات برای همه کاربرها قفل نشه."""
-    channel = _force_join_channel_username()
-    if not channel:
-        return True
-
-    cached = _membership_cache.get(user_id)
-    if cached and (monotonic() - cached[1]) < MEMBERSHIP_CACHE_TTL:
-        return cached[0]
-
-    try:
-        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-        is_member = member.status in ("member", "administrator", "creator")
-    except Exception as e:
-        logging.warning(
-            f"Could not check channel membership for {user_id}: {e} "
-            f"(مطمئن شوید ربات به عنوان ادمین توی کانال {channel} اضافه شده)"
-        )
-        is_member = True
-    _membership_cache[user_id] = (is_member, monotonic())
-    return is_member
-
-
-def join_channel_kb() -> InlineKeyboardMarkup:
-    channel = _force_join_channel_username().lstrip("@")
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 عضویت در کانال", url=f"https://t.me/{channel}", style="primary")],
-            [InlineKeyboardButton(text="✅ بررسی عضویت", callback_data="checkjoin", style="success")],
-        ]
-    )
-
-
-JOIN_REQUIRED_TEXT = (
-    "🚫 <b>برای استفاده از ربات، اول باید عضو کانال ما بشید.</b>\n\n"
-    "بعد از عضویت روی دکمه «✅ بررسی عضویت» بزنید."
-)
-
-
-class ForceJoinMiddleware(BaseMiddleware):
-    """قبل از پردازش هر پیام/دکمه، عضویت کاربر توی کانال اجباری رو چک می‌کنه.
-    دستور /start (که خودش این چک رو انجام میده) و دکمه «بررسی عضویت» از این میان‌افزار مستثنی هستن."""
-
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if user is None or not _force_join_channel_username():
-            return await handler(event, data)
-
-        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
-            return await handler(event, data)
-        if isinstance(event, CallbackQuery) and event.data == "checkjoin":
-            return await handler(event, data)
-
-        if not await is_channel_member(user.id):
-            if isinstance(event, CallbackQuery):
-                await event.answer("⚠️ ابتدا باید عضو کانال بشید!", show_alert=True)
-                try:
-                    await event.message.edit_text(
-                        JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=join_channel_kb()
-                    )
-                except Exception:
-                    pass
-            elif isinstance(event, Message):
-                await event.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=join_channel_kb())
-            return  # درخواست همینجا متوقف میشه و به هندلر اصلی نمی‌رسه
-        return await handler(event, data)
-
-
-dp.message.outer_middleware(ForceJoinMiddleware())
-dp.callback_query.outer_middleware(ForceJoinMiddleware())
-
-
 # ---------- States ----------
 class BuyStates(StatesGroup):
     waiting_for_receipt = State()
@@ -164,18 +77,10 @@ class AdminStates(StatesGroup):
     waiting_for_reject_reason = State()
     editing_gaming_price = State()
     editing_multi_price = State()
-    editing_gaming_volume = State()
-    editing_multi_label = State()
     adding_gaming_volume = State()
     adding_gaming_price = State()
     adding_multi_label = State()
     adding_multi_price = State()
-    adding_panel_category_name = State()
-    editing_panel_category_name = State()
-    adding_panel_item_title = State()
-    adding_panel_item_price = State()
-    editing_panel_item_title = State()
-    editing_panel_item_price = State()
     editing_welcome_message = State()
     editing_referral_percent = State()
     editing_rules_text = State()
@@ -221,24 +126,14 @@ async def get_all_admin_ids() -> list[int]:
 
 
 # ---------- Keyboards ----------
-# رنگ دکمه‌های منوی اصلی (نیازمند Bot API 9.4+ / نسخه به‌روز تلگرام - در کلاینت‌های قدیمی‌تر رنگ پیش‌فرض نمایش داده میشه)
 async def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
-        [
-            KeyboardButton(text="🛍 خرید سرویس", style="danger"),
-            KeyboardButton(text="🖥 سرویس‌های من", style="success"),
-        ],
-        [
-            KeyboardButton(text="💰 کیف پول", style="success"),
-            KeyboardButton(text="💬 پشتیبانی", style="primary"),
-        ],
-        [
-            KeyboardButton(text="🤝 دعوت دوستان", style="danger"),
-            KeyboardButton(text="📜 قوانین", style="primary"),
-        ],
+        [KeyboardButton(text="🛍 خرید سرویس"), KeyboardButton(text="🖥 سرویس‌های من")],
+        [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="💬 پشتیبانی")],
+        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="📜 قوانین")],
     ]
     if user_id is not None and await get_admin_role(user_id) is not None:
-        keyboard.append([KeyboardButton(text="🛠 مدیریت ربات", style="primary")])
+        keyboard.append([KeyboardButton(text="🛠 مدیریت ربات")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
@@ -249,89 +144,11 @@ def back_menu_kb() -> InlineKeyboardMarkup:
 
 
 def services_kb() -> InlineKeyboardMarkup:
-    """منوی اصلیِ «خرید سرویس»: انتخاب بین کانفیگ یا پنل نمایندگی."""
     rows = [
-        [InlineKeyboardButton(text="🧩 کانفیگ", callback_data="svc:config", style="primary")],
-        [InlineKeyboardButton(text="🖥 خرید پنل نمایندگی", callback_data="svc:panel", style="danger")],
-        [InlineKeyboardButton(text="🎁 دریافت اکانت تست رایگان", callback_data="svc:trial", style="primary")],
+        [InlineKeyboardButton(text="🎮 سرویس گیمینگ", callback_data="svc:gaming")],
+        [InlineKeyboardButton(text="🌍 سرویس مولتی لوکیشن (وبگردی)", callback_data="svc:multi")],
         [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
     ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def config_kb() -> InlineKeyboardMarkup:
-    """زیرمنوی «کانفیگ»: گیم / وبگردی."""
-    rows = [
-        [InlineKeyboardButton(text="🎮 کانفیگ گیم", callback_data="svc:gaming", style="primary")],
-        [InlineKeyboardButton(text="🌐 کانفیگ وبگردی (مولتی لوکیشن)", callback_data="svc:multi", style="primary")],
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def panel_categories_kb(categories) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=c["name"], callback_data=f"panelcat:{c['id']}", style="danger")]
-        for c in categories
-    ]
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-PANEL_VOLUME_TIERS_GB = [250, 500, 750, 1000, 2000, 3000]
-
-
-def panel_items_kb(items) -> InlineKeyboardMarkup:
-    """لیست گزینه‌های هر پنل - قیمت نمایش داده‌شده نرخ هر گیگه؛ حجم نهایی توی مرحله بعد انتخاب میشه."""
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=f"{it['title']} - {it['price']:,} تومان/گیگ", callback_data=f"panelitem:{it['id']}", style="danger"
-            )
-        ]
-        for it in items
-    ]
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="svc:panel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def panel_volume_kb(item_id: int, price_per_gb: int, category_id: int) -> InlineKeyboardMarkup:
-    """لیست حجم‌های ثابت (۲۵۰ تا ۳۰۰۰ گیگ) برای گزینه انتخاب‌شده - قیمت هرکدوم = حجم × نرخ هر گیگ."""
-    rows = []
-    row = []
-    for vol in PANEL_VOLUME_TIERS_GB:
-        price = vol * price_per_gb
-        row.append(
-            InlineKeyboardButton(
-                text=f"{vol:,} گیگ - {price:,} تومان", callback_data=f"panelvol:{item_id}:{vol}", style="danger"
-            )
-        )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"panelcat:{category_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def trial_categories_kb(categories) -> InlineKeyboardMarkup:
-    """کیبورد انتخاب پنل برای درخواست تست - از همون پنل‌های نمایندگی فعلی."""
-    rows = [
-        [InlineKeyboardButton(text=c["name"], callback_data=f"trialcat:{c['id']}", style="primary")]
-        for c in categories
-    ]
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def trial_items_kb(items) -> InlineKeyboardMarkup:
-    """کیبورد انتخاب کانفیگ/گزینه مورد نظر برای تست (بدون نمایش قیمت، چون رایگانه)."""
-    rows = [
-        [InlineKeyboardButton(text=it["title"], callback_data=f"trialitem:{it['id']}", style="primary")]
-        for it in items
-    ]
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="svc:trial")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -340,65 +157,46 @@ def gaming_plans_kb(plans) -> InlineKeyboardMarkup:
     row = []
     for p in plans:
         row.append(
-            InlineKeyboardButton(
-                text=f"{p['volume_gb']} گیگ - {p['price']:,} تومان", callback_data=f"gplan:{p['id']}", style="success"
-            )
+            InlineKeyboardButton(text=f"{p['volume_gb']} گیگ - {p['price']:,} تومان", callback_data=f"gplan:{p['id']}")
         )
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:config")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def multi_plans_kb(plans) -> InlineKeyboardMarkup:
     rows = [
-        [
-            InlineKeyboardButton(
-                text=f"{p['label']} - {p['price']:,} تومان", callback_data=f"mplan:{p['id']}", style="success"
-            )
-        ]
+        [InlineKeyboardButton(text=f"{p['label']} - {p['price']:,} تومان", callback_data=f"mplan:{p['id']}")]
         for p in plans
     ]
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:config")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def build_order_summary_kb(order) -> InlineKeyboardMarkup:
     """کیبورد صفحه خلاصه سفارش: ارسال رسید، کد تخفیف، پرداخت با کیف پول (در صورت کافی بودن موجودی) یا بازگشت."""
-    plan_name = str(order["plan_name"])
-    if plan_name.startswith("🎮"):
-        kind = "gaming"
-    elif plan_name.startswith("🖥"):
-        item = await db.get_panel_item(order["plan_id"])
-        kind = f"panelvol-{order['plan_id']}" if item else "panelroot"
-    else:
-        kind = "multi"
-    rows = [[InlineKeyboardButton(text="📤 ارسال رسید", callback_data=f"reqreceipt:{order['id']}", style="success")]]
+    kind = "gaming" if str(order["plan_name"]).startswith("🎮") else "multi"
+    rows = [[InlineKeyboardButton(text="📤 ارسال رسید", callback_data=f"reqreceipt:{order['id']}")]]
 
     if order["coupon_code"]:
         rows.append(
             [
-                InlineKeyboardButton(text="🔄 تغییر کد تخفیف", callback_data=f"applycoupon:{order['id']}", style="primary"),
-                InlineKeyboardButton(text="🗑 حذف تخفیف", callback_data=f"removecoupon:{order['id']}", style="danger"),
+                InlineKeyboardButton(text="🔄 تغییر کد تخفیف", callback_data=f"applycoupon:{order['id']}"),
+                InlineKeyboardButton(text="🗑 حذف تخفیف", callback_data=f"removecoupon:{order['id']}"),
             ]
         )
     else:
-        rows.append([InlineKeyboardButton(text="🎟 اعمال کد تخفیف", callback_data=f"applycoupon:{order['id']}", style="primary")])
+        rows.append([InlineKeyboardButton(text="🎟 اعمال کد تخفیف", callback_data=f"applycoupon:{order['id']}")])
 
     if order["price"] and order["price"] > 0:
         balance = await db.get_wallet_balance(order["user_id"])
         if balance >= order["price"]:
             rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"💰 پرداخت با کیف پول ({balance:,} تومان)",
-                        callback_data=f"walletpay:{order['id']}",
-                        style="success",
-                    )
-                ]
+                [InlineKeyboardButton(text=f"💰 پرداخت با کیف پول ({balance:,} تومان)", callback_data=f"walletpay:{order['id']}")]
             )
 
     rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"cancelorder:{order['id']}:{kind}")])
@@ -436,8 +234,8 @@ def admin_decision_kb(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ تأیید", callback_data=f"approve:{order_id}", style="success"),
-                InlineKeyboardButton(text="❌ رد", callback_data=f"reject:{order_id}", style="danger"),
+                InlineKeyboardButton(text="✅ تأیید", callback_data=f"approve:{order_id}"),
+                InlineKeyboardButton(text="❌ رد", callback_data=f"reject:{order_id}"),
             ]
         ]
     )
@@ -473,11 +271,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
                     except Exception as e:
                         logging.warning(f"Could not notify referrer {referrer_id}: {e}")
 
-    # عضویت اجباری در کانال - قبل از نمایش منوی اصلی چک میشه (لینک رفرال بالا قبلاً پردازش شد)
-    if not await is_channel_member(message.from_user.id):
-        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=join_channel_kb())
-        return
-
     custom_welcome = await db.get_welcome_message()
     if custom_welcome:
         text = custom_welcome
@@ -493,43 +286,10 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await message.answer(text, parse_mode="HTML", reply_markup=await main_menu_kb(message.from_user.id))
 
 
-@dp.callback_query(F.data == "checkjoin")
-async def check_join_callback(callback: CallbackQuery, state: FSMContext):
-    """کاربر روی «✅ بررسی عضویت» زده - دوباره چک میشه و در صورت عضویت، منوی اصلی نشون داده میشه."""
-    _membership_cache.pop(callback.from_user.id, None)  # کش رو پاک می‌کنیم تا وضعیت تازه چک بشه
-    if not await is_channel_member(callback.from_user.id):
-        await callback.answer("❌ هنوز عضو کانال نشدید! لطفاً اول عضو بشید.", show_alert=True)
-        return
-
-    await callback.answer("✅ عضویت شما تأیید شد!", show_alert=True)
-    await db.touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name or "")
-
-    custom_welcome = await db.get_welcome_message()
-    if custom_welcome:
-        text = custom_welcome
-    else:
-        text = (
-            f"✨ <b>{config.BRAND_NAME}</b> ✨\n\n"
-            f"👋 به پلتفرم فروش سرویس {config.BRAND_NAME} خوش اومدید\n\n"
-            f"🎁 <b>چی دریافت می‌کنید؟</b>\n"
-            f"🎮 سرویس گیمینگ با حجم دلخواه\n"
-            f"🌍 سرویس مولتی لوکیشن (وبگردی) با پلن نامحدود\n\n"
-            f"🟢 سرویس فعال دارید؟ از دکمه «🖥 سرویس‌های من» وارد شوید"
-        )
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=await main_menu_kb(callback.from_user.id))
-
-
 @dp.message(F.text == "🛍 خرید سرویس")
 async def show_services(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:\n\n۱- کانفیگ\n۲- خرید پنل نمایندگی",
-        reply_markup=services_kb(),
-    )
+    await message.answer("🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:", reply_markup=services_kb())
 
 
 @dp.callback_query(F.data == "back:menu")
@@ -544,205 +304,14 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "back:services")
 async def back_to_services(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text(
-        "🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:\n\n۱- کانفیگ\n۲- خرید پنل نمایندگی",
-        reply_markup=services_kb(),
-    )
+    await callback.message.edit_text("🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:", reply_markup=services_kb())
     await callback.answer()
-
-
-@dp.callback_query(F.data == "svc:config")
-async def choose_config_service(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("🧩 <b>کانفیگ</b>\nنوع کانفیگ مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=config_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back:config")
-async def back_to_config(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("🧩 <b>کانفیگ</b>\nنوع کانفیگ مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=config_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "svc:panel")
-async def choose_panel_service(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    categories = await db.get_panel_categories()
-    if not categories:
-        await callback.answer("در حال حاضر پنلی برای نمایندگی ثبت نشده.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "🖥 <b>خرید پنل نمایندگی</b>\nپنل مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=panel_categories_kb(categories)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("panelcat:"))
-async def choose_panel_category(callback: CallbackQuery, state: FSMContext):
-    category_id = int(callback.data.split(":")[1])
-    category = await db.get_panel_category(category_id)
-    items = await db.get_panel_items(category_id)
-    if not category or not items:
-        await callback.answer("در حال حاضر گزینه‌ای برای این پنل ثبت نشده.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        f"🖥 <b>{category['name']}</b>\nگزینه مورد نظر رو انتخاب کنید:",
-        parse_mode="HTML",
-        reply_markup=panel_items_kb(items),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("panelitem:"))
-async def choose_panel_item(callback: CallbackQuery, state: FSMContext):
-    """کاربر یک گزینه از پنل رو انتخاب کرد -> حالا باید حجم (گیگ) مورد نظرش رو انتخاب کنه."""
-    item_id = int(callback.data.split(":")[1])
-    item = await db.get_panel_item(item_id)
-    if not item or not item["active"]:
-        await callback.answer("این گزینه دیگر موجود نیست.", show_alert=True)
-        return
-    category = await db.get_panel_category(item["category_id"])
-    cat_name = category["name"] if category else "پنل نمایندگی"
-
-    await state.clear()
-    await callback.message.edit_text(
-        f"🖥 <b>{cat_name}</b>\n📦 {item['title']}\n\nحجم مورد نظرتون رو انتخاب کنید:",
-        parse_mode="HTML",
-        reply_markup=panel_volume_kb(item_id, item["price"], item["category_id"]),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("panelvol:"))
-async def choose_panel_volume(callback: CallbackQuery, state: FSMContext):
-    """کاربر حجم مورد نظرش رو انتخاب کرد -> سفارش با قیمت (حجم × نرخ هر گیگ) ثبت میشه."""
-    _, item_id_str, volume_str = callback.data.split(":")
-    item_id = int(item_id_str)
-    volume_gb = int(volume_str)
-
-    item = await db.get_panel_item(item_id)
-    if not item or not item["active"]:
-        await callback.answer("این گزینه دیگر موجود نیست.", show_alert=True)
-        return
-    if volume_gb not in PANEL_VOLUME_TIERS_GB:
-        await callback.answer("حجم انتخاب‌شده نامعتبره.", show_alert=True)
-        return
-
-    category = await db.get_panel_category(item["category_id"])
-    cat_name = category["name"] if category else "پنل نمایندگی"
-    price = volume_gb * item["price"]
-    plan_name = f"🖥 {cat_name} - {item['title']} - {volume_gb:,} گیگ"
-
-    order_id = await db.create_order(
-        user_id=callback.from_user.id,
-        username=callback.from_user.username or "",
-        full_name=callback.from_user.full_name,
-        plan_id=item_id,
-        plan_name=plan_name,
-        price=price,
-    )
-
-    await state.clear()
-    order = await db.get_order(order_id)
-    await callback.message.edit_text(
-        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "svc:trial")
-async def choose_trial_service(callback: CallbackQuery, state: FSMContext):
-    """شروع مسیر «دریافت اکانت تست رایگان» - کاربر پنل و کانفیگ مورد نظرش رو انتخاب می‌کنه."""
-    await state.clear()
-    if await db.has_requested_trial(callback.from_user.id):
-        await callback.answer(
-            "شما قبلاً یک اکانت تست دریافت کرده‌اید. هر کاربر فقط یک‌بار می‌تونه تست بگیره.",
-            show_alert=True,
-        )
-        return
-
-    categories = await db.get_panel_categories()
-    if not categories:
-        await callback.answer("در حال حاضر پنلی برای تست ثبت نشده.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "🎁 <b>دریافت اکانت تست رایگان</b>\nکدوم پنل رو می‌خواید امتحان کنید؟",
-        parse_mode="HTML",
-        reply_markup=trial_categories_kb(categories),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("trialcat:"))
-async def choose_trial_category(callback: CallbackQuery, state: FSMContext):
-    category_id = int(callback.data.split(":")[1])
-    category = await db.get_panel_category(category_id)
-    items = await db.get_panel_items(category_id)
-    if not category or not items:
-        await callback.answer("در حال حاضر گزینه‌ای برای این پنل ثبت نشده.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        f"🎁 <b>تست {category['name']}</b>\nکدوم کانفیگ رو می‌خواید تست کنید؟",
-        parse_mode="HTML",
-        reply_markup=trial_items_kb(items),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("trialitem:"))
-async def choose_trial_item(callback: CallbackQuery, state: FSMContext):
-    """کاربر کانفیگ مورد نظرش برای تست رو انتخاب کرد -> درخواست مستقیم برای ادمین ارسال میشه."""
-    if await db.has_requested_trial(callback.from_user.id):
-        await callback.answer(
-            "شما قبلاً یک اکانت تست دریافت کرده‌اید. هر کاربر فقط یک‌بار می‌تونه تست بگیره.",
-            show_alert=True,
-        )
-        return
-
-    item_id = int(callback.data.split(":")[1])
-    item = await db.get_panel_item(item_id)
-    if not item or not item["active"]:
-        await callback.answer("این گزینه دیگر موجود نیست.", show_alert=True)
-        return
-    category = await db.get_panel_category(item["category_id"])
-    cat_name = category["name"] if category else "پنل نمایندگی"
-    plan_name = f"🎁 تست - {cat_name} - {item['title']}"
-
-    order_id = await db.create_trial_order(
-        user_id=callback.from_user.id,
-        username=callback.from_user.username or "",
-        full_name=callback.from_user.full_name,
-        plan_id=item_id,
-        plan_name=plan_name,
-    )
-
-    await state.clear()
-    await callback.message.edit_text(
-        "✅ درخواست تست شما ثبت شد و برای ادمین ارسال شد.\n"
-        "به محض تأیید، اطلاعات اکانت تست‌تون همینجا ارسال میشه.",
-        reply_markup=back_menu_kb(),
-    )
-    await callback.answer()
-
-    caption = (
-        f"🎁 <b>درخواست تست جدید</b> #{order_id}\n"
-        f"👤 کاربر: {callback.from_user.full_name} (@{callback.from_user.username or '-'})\n"
-        f"🆔 آیدی عددی: {callback.from_user.id}\n"
-        f"📦 پنل/کانفیگ درخواستی: {cat_name} - {item['title']}\n\n"
-        f"ℹ️ این یک درخواست تست رایگانه (بدون پرداخت)."
-    )
-    for admin_id in await get_all_admin_ids():
-        try:
-            await bot.send_message(admin_id, caption, parse_mode="HTML", reply_markup=admin_decision_kb(order_id))
-        except Exception as e:
-            logging.warning(f"Could not notify admin {admin_id} about trial request: {e}")
 
 
 @dp.callback_query(F.data.startswith("cancelorder:"))
 async def cancel_order_and_go_back(callback: CallbackQuery, state: FSMContext):
     """کاربر از صفحه خلاصه سفارش «بازگشت» رو زده -> سفارش لغو میشه و به لیست تعرفه‌های همون سرویس برمی‌گرده."""
-    _, order_id_str, kind = callback.data.split(":", 2)
+    _, order_id_str, kind = callback.data.split(":")
     order_id = int(order_id_str)
     order = await db.get_order(order_id)
     if order and order["user_id"] == callback.from_user.id and order["status"] in ("awaiting_receipt", "pending"):
@@ -755,52 +324,17 @@ async def cancel_order_and_go_back(callback: CallbackQuery, state: FSMContext):
             await callback.answer("در حال حاضر تعرفه‌ای برای این سرویس ثبت نشده.", show_alert=True)
             return
         await callback.message.edit_text(
-            "🎮 <b>کانفیگ گیم</b>\nحجم مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=gaming_plans_kb(plans)
+            "🎮 <b>سرویس گیمینگ</b>\nحجم مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=gaming_plans_kb(plans)
         )
-    elif kind == "multi":
+    else:
         plans = await db.get_multi_plans()
         if not plans:
             await callback.answer("در حال حاضر تعرفه‌ای برای این سرویس ثبت نشده.", show_alert=True)
             return
         await callback.message.edit_text(
-            "🌐 <b>کانفیگ وبگردی (مولتی لوکیشن)</b>\nتعرفه مورد نظر رو انتخاب کنید:",
+            "🌍 <b>سرویس مولتی لوکیشن (وبگردی)</b>\nتعرفه مورد نظر رو انتخاب کنید:",
             parse_mode="HTML",
             reply_markup=multi_plans_kb(plans),
-        )
-    elif kind.startswith("panelvol-"):
-        item_id = int(kind.split("-", 1)[1])
-        item = await db.get_panel_item(item_id)
-        if not item or not item["active"]:
-            await callback.answer("این گزینه دیگر موجود نیست.", show_alert=True)
-            return
-        category = await db.get_panel_category(item["category_id"])
-        cat_name = category["name"] if category else "پنل نمایندگی"
-        await callback.message.edit_text(
-            f"🖥 <b>{cat_name}</b>\n📦 {item['title']}\n\nحجم مورد نظرتون رو انتخاب کنید:",
-            parse_mode="HTML",
-            reply_markup=panel_volume_kb(item_id, item["price"], item["category_id"]),
-        )
-    elif kind.startswith("panel-"):
-        category_id = int(kind.split("-", 1)[1])
-        category = await db.get_panel_category(category_id)
-        items = await db.get_panel_items(category_id)
-        if not category or not items:
-            await callback.answer("در حال حاضر گزینه‌ای برای این پنل ثبت نشده.", show_alert=True)
-            return
-        await callback.message.edit_text(
-            f"🖥 <b>{category['name']}</b>\nگزینه مورد نظر رو انتخاب کنید:",
-            parse_mode="HTML",
-            reply_markup=panel_items_kb(items),
-        )
-    else:
-        categories = await db.get_panel_categories()
-        if not categories:
-            await callback.answer("در حال حاضر پنلی برای نمایندگی ثبت نشده.", show_alert=True)
-            return
-        await callback.message.edit_text(
-            "🖥 <b>خرید پنل نمایندگی</b>\nپنل مورد نظر رو انتخاب کنید:",
-            parse_mode="HTML",
-            reply_markup=panel_categories_kb(categories),
         )
     await callback.answer()
 
@@ -812,7 +346,7 @@ async def choose_gaming_service(callback: CallbackQuery, state: FSMContext):
         await callback.answer("در حال حاضر تعرفه‌ای برای این سرویس ثبت نشده.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🎮 <b>کانفیگ گیم</b>\nحجم مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=gaming_plans_kb(plans)
+        "🎮 <b>سرویس گیمینگ</b>\nحجم مورد نظر رو انتخاب کنید:", parse_mode="HTML", reply_markup=gaming_plans_kb(plans)
     )
     await callback.answer()
 
@@ -824,7 +358,7 @@ async def choose_multi_service(callback: CallbackQuery, state: FSMContext):
         await callback.answer("در حال حاضر تعرفه‌ای برای این سرویس ثبت نشده.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🌐 <b>کانفیگ وبگردی (مولتی لوکیشن)</b>\nتعرفه مورد نظر رو انتخاب کنید:",
+        "🌍 <b>سرویس مولتی لوکیشن (وبگردی)</b>\nتعرفه مورد نظر رو انتخاب کنید:",
         parse_mode="HTML",
         reply_markup=multi_plans_kb(plans),
     )
@@ -1113,12 +647,11 @@ def my_orders_kb(orders) -> InlineKeyboardMarkup:
 
 
 def order_detail_text(order) -> str:
-    price_line = "💰 مبلغ: 🎁 رایگان (تست)" if order["order_type"] == "trial" else f"💰 مبلغ: {order['price']:,} تومان"
     text = (
         f"🆔 <b>سفارش #{order['id']}</b>\n"
         f"—————————————\n"
         f"📦 پلن: {order['plan_name']}\n"
-        f"{price_line}\n"
+        f"💰 مبلغ: {order['price']:,} تومان\n"
         f"📌 وضعیت: {ORDER_STATUS_MAP.get(order['status'], order['status'])}"
     )
     if order["status"] == "delivered" and order["panel_info"]:
@@ -1482,89 +1015,23 @@ async def invite_handler(message: Message, state: FSMContext):
 
 # ---------- Admin: management panel ----------
 def admin_menu_kb(role: str) -> InlineKeyboardMarkup:
-    """منوی اصلی مدیریت - دسته‌بندی‌شده و دو-ستونی تا پشت‌سرهم و درهم نباشه."""
-    rows = [[InlineKeyboardButton(text="👥 کاربران", callback_data="ausers:page:0", style="primary")]]
+    rows = [[InlineKeyboardButton(text="👥 کاربران", callback_data="ausers:page:0")]]
     if role in ("owner", "manager"):
-        rows[0].append(InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons", style="primary"))
+        rows.append([InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons")])
     if role == "owner":
         rows += [
-            [InlineKeyboardButton(text="💰 قیمت‌گذاری و پنل‌ها", callback_data="admincat:pricing", style="danger")],
-            [
-                InlineKeyboardButton(text="✉️ محتوای ربات", callback_data="admincat:content", style="primary"),
-                InlineKeyboardButton(text="🤝 رفرال و تخفیف", callback_data="admincat:referral", style="success"),
-            ],
-            [
-                InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adminbroadcast", style="primary"),
-                InlineKeyboardButton(text="👮 مدیریت ادمین‌ها", callback_data="adminmanage", style="danger"),
-            ],
-            [InlineKeyboardButton(text="📦 بکاپ / ریستور دیتابیس", callback_data="adminbackup", style="success")],
+            [InlineKeyboardButton(text="📢 ارسال پیام همگانی", callback_data="adminbroadcast")],
+            [InlineKeyboardButton(text="🎮 تعرفه‌های گیمینگ", callback_data="admintariff:gaming")],
+            [InlineKeyboardButton(text="🌍 تعرفه‌های مولتی لوکیشن", callback_data="admintariff:multi")],
+            [InlineKeyboardButton(text="✉️ پیام خوش‌آمدگویی", callback_data="adminwelcome")],
+            [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules")],
+            [InlineKeyboardButton(text="🤝 تنظیمات رفرال", callback_data="adminreferral")],
+            [InlineKeyboardButton(text="💳 تخفیف شارژ کیف پول", callback_data="adminwalletbonus")],
+            [InlineKeyboardButton(text="📦 بکاپ / ریستور دیتابیس", callback_data="adminbackup")],
+            [InlineKeyboardButton(text="👮 مدیریت ادمین‌ها", callback_data="adminmanage")],
         ]
     rows.append([InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_pricing_kb() -> InlineKeyboardMarkup:
-    """زیرمنوی «قیمت‌گذاری و پنل‌ها»: تعرفه‌ها و پنل‌های نمایندگی."""
-    rows = [
-        [InlineKeyboardButton(text="🎮 تعرفه‌های کانفیگ گیم", callback_data="admintariff:gaming", style="primary")],
-        [InlineKeyboardButton(text="🌐 تعرفه‌های کانفیگ وبگردی", callback_data="admintariff:multi", style="primary")],
-        [InlineKeyboardButton(text="🖥 مدیریت پنل‌های نمایندگی", callback_data="adminpanels", style="danger")],
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_content_kb() -> InlineKeyboardMarkup:
-    """زیرمنوی «محتوای ربات»: پیام خوش‌آمد و قوانین."""
-    rows = [
-        [InlineKeyboardButton(text="✉️ پیام خوش‌آمدگویی", callback_data="adminwelcome", style="primary")],
-        [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules", style="primary")],
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_referral_kb() -> InlineKeyboardMarkup:
-    """زیرمنوی «رفرال و تخفیف»: تنظیمات رفرال و تخفیف شارژ کیف پول."""
-    rows = [
-        [InlineKeyboardButton(text="🤝 تنظیمات رفرال", callback_data="adminreferral", style="success")],
-        [InlineKeyboardButton(text="💳 تخفیف شارژ کیف پول", callback_data="adminwalletbonus", style="success")],
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "admincat:pricing")
-async def admin_category_pricing(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) != "owner":
-        await callback.answer("شما دسترسی ندارید.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "💰 <b>قیمت‌گذاری و پنل‌ها</b>\nچی رو می‌خواید تنظیم کنید؟", parse_mode="HTML", reply_markup=admin_pricing_kb()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admincat:content")
-async def admin_category_content(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) != "owner":
-        await callback.answer("شما دسترسی ندارید.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "✉️ <b>محتوای ربات</b>\nچی رو می‌خواید ویرایش کنید؟", parse_mode="HTML", reply_markup=admin_content_kb()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admincat:referral")
-async def admin_category_referral(callback: CallbackQuery, state: FSMContext):
-    if await get_admin_role(callback.from_user.id) != "owner":
-        await callback.answer("شما دسترسی ندارید.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        "🤝 <b>رفرال و تخفیف</b>\nچی رو می‌خواید تنظیم کنید؟", parse_mode="HTML", reply_markup=admin_referral_kb()
-    )
-    await callback.answer()
 
 
 async def gaming_admin_list_kb() -> InlineKeyboardMarkup:
@@ -1577,17 +1044,11 @@ async def gaming_admin_list_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=f"{status} {p['volume_gb']} گیگ - {p['price']:,} تومان",
                     callback_data=f"gpriceedit:{p['id']}",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(text="✏️ متن", callback_data=f"gedittext:{p['id']}"),
+                ),
                 InlineKeyboardButton(
                     text="غیرفعال" if p["active"] else "فعال",
                     callback_data=f"gtoggle:{p['id']}",
                 ),
-                InlineKeyboardButton(text="🗑 حذف", callback_data=f"gdelete:{p['id']}"),
             ]
         )
     rows.append([InlineKeyboardButton(text="➕ افزودن تعرفه جدید", callback_data="gadd")])
@@ -1605,68 +1066,15 @@ async def multi_admin_list_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=f"{status} {p['label']} - {p['price']:,} تومان",
                     callback_data=f"mpriceedit:{p['id']}",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(text="✏️ متن", callback_data=f"medittext:{p['id']}"),
+                ),
                 InlineKeyboardButton(
                     text="غیرفعال" if p["active"] else "فعال",
                     callback_data=f"mtoggle:{p['id']}",
                 ),
-                InlineKeyboardButton(text="🗑 حذف", callback_data=f"mdelete:{p['id']}"),
             ]
         )
     rows.append([InlineKeyboardButton(text="➕ افزودن تعرفه جدید", callback_data="madd")])
     rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def panel_admin_categories_kb() -> InlineKeyboardMarkup:
-    categories = await db.get_panel_categories(active_only=False)
-    rows = []
-    for c in categories:
-        status = "✅" if c["active"] else "🚫"
-        rows.append([InlineKeyboardButton(text=f"{status} {c['name']}", callback_data=f"pcatopen:{c['id']}")])
-    rows.append([InlineKeyboardButton(text="➕ افزودن سرویس/پنل جدید", callback_data="pcatadd")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def panel_admin_category_detail_kb(category_id: int) -> InlineKeyboardMarkup:
-    category = await db.get_panel_category(category_id)
-    active = bool(category["active"]) if category else True
-    rows = [
-        [
-            InlineKeyboardButton(text="✏️ تغییر نام پنل", callback_data=f"pcatedit:{category_id}"),
-            InlineKeyboardButton(text="غیرفعال" if active else "فعال", callback_data=f"pcattoggle:{category_id}"),
-        ],
-        [InlineKeyboardButton(text="🗑 حذف کل این پنل", callback_data=f"pcatdelete:{category_id}")],
-    ]
-    items = await db.get_panel_items(category_id, active_only=False)
-    for it in items:
-        status = "✅" if it["active"] else "🚫"
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{status} {it['title']} - {it['price']:,} تومان/گیگ",
-                    callback_data=f"pitempriceedit:{it['id']}",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(text="✏️ متن", callback_data=f"pitemedittext:{it['id']}"),
-                InlineKeyboardButton(
-                    text="غیرفعال" if it["active"] else "فعال",
-                    callback_data=f"pitemtoggle:{it['id']}",
-                ),
-                InlineKeyboardButton(text="🗑 حذف", callback_data=f"pitemdelete:{it['id']}"),
-            ]
-        )
-    rows.append([InlineKeyboardButton(text="➕ افزودن گزینه جدید", callback_data=f"pitemadd:{category_id}")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت به لیست پنل‌ها", callback_data="adminpanels")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2635,8 +2043,7 @@ async def admintariff_gaming(callback: CallbackQuery, state: FSMContext):
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🎮 <b>تعرفه‌های کانفیگ گیم</b>\nروی هر تعرفه بزنید تا قیمتش رو تغییر بدید؛ با «✏️ متن» می‌تونید حجم رو عوض کنید، "
-        "با «🗑 حذف» تعرفه رو کاملاً حذف کنید یا فعال/غیرفعالش کنید:",
+        "🎮 <b>تعرفه‌های سرویس گیمینگ</b>\nروی هر تعرفه بزنید تا قیمتش رو تغییر بدید، یا فعال/غیرفعالش کنید:",
         parse_mode="HTML",
         reply_markup=await gaming_admin_list_kb(),
     )
@@ -2649,8 +2056,7 @@ async def admintariff_multi(callback: CallbackQuery, state: FSMContext):
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🌐 <b>تعرفه‌های کانفیگ وبگردی</b>\nروی هر تعرفه بزنید تا قیمتش رو تغییر بدید؛ با «✏️ متن» می‌تونید عنوان رو عوض کنید، "
-        "با «🗑 حذف» تعرفه رو کاملاً حذف کنید یا فعال/غیرفعالش کنید:",
+        "🌍 <b>تعرفه‌های سرویس مولتی لوکیشن</b>\nروی هر تعرفه بزنید تا قیمتش رو تغییر بدید، یا فعال/غیرفعالش کنید:",
         parse_mode="HTML",
         reply_markup=await multi_admin_list_kb(),
     )
@@ -2677,88 +2083,6 @@ async def toggle_multi(callback: CallbackQuery, state: FSMContext):
     await db.toggle_multi_active(plan_id)
     await callback.message.edit_reply_markup(reply_markup=await multi_admin_list_kb())
     await callback.answer("وضعیت تعرفه تغییر کرد.")
-
-
-@dp.callback_query(F.data.startswith("gdelete:"))
-async def delete_gaming(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    plan_id = int(callback.data.split(":")[1])
-    await db.delete_gaming_plan(plan_id)
-    await callback.message.edit_reply_markup(reply_markup=await gaming_admin_list_kb())
-    await callback.answer("✅ تعرفه حذف شد.")
-
-
-@dp.callback_query(F.data.startswith("mdelete:"))
-async def delete_multi(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    plan_id = int(callback.data.split(":")[1])
-    await db.delete_multi_plan(plan_id)
-    await callback.message.edit_reply_markup(reply_markup=await multi_admin_list_kb())
-    await callback.answer("✅ تعرفه حذف شد.")
-
-
-@dp.callback_query(F.data.startswith("gedittext:"))
-async def start_edit_gaming_volume(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    plan_id = int(callback.data.split(":")[1])
-    plan = await db.get_gaming_plan(plan_id)
-    if not plan:
-        await callback.answer("این تعرفه پیدا نشد.", show_alert=True)
-        return
-    await state.update_data(plan_id=plan_id)
-    await state.set_state(AdminStates.editing_gaming_volume)
-    await callback.message.answer(
-        f"حجم جدید (به گیگابایت) رو به‌جای «{plan['volume_gb']} گیگ» بفرستید (فقط عدد):"
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_gaming_volume)
-async def save_gaming_volume(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("لطفاً فقط عدد بفرستید (مثال: 60)")
-        return
-    data = await state.get_data()
-    plan_id = data.get("plan_id")
-    await db.update_gaming_volume(plan_id, int(text))
-    await state.clear()
-    await message.answer("✅ متن (حجم) تعرفه بروزرسانی شد.", reply_markup=await gaming_admin_list_kb())
-
-
-@dp.callback_query(F.data.startswith("medittext:"))
-async def start_edit_multi_label(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    plan_id = int(callback.data.split(":")[1])
-    plan = await db.get_multi_plan(plan_id)
-    if not plan:
-        await callback.answer("این تعرفه پیدا نشد.", show_alert=True)
-        return
-    await state.update_data(plan_id=plan_id)
-    await state.set_state(AdminStates.editing_multi_label)
-    await callback.message.answer(f"متن جدید رو به‌جای «{plan['label']}» بفرستید:")
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_multi_label)
-async def save_multi_label(message: Message, state: FSMContext):
-    label = (message.text or "").strip()
-    if not label:
-        await message.answer("لطفاً یه متن معتبر بفرستید.")
-        return
-    data = await state.get_data()
-    plan_id = data.get("plan_id")
-    await db.update_multi_label(plan_id, label)
-    await state.clear()
-    await message.answer("✅ متن تعرفه بروزرسانی شد.", reply_markup=await multi_admin_list_kb())
 
 
 @dp.callback_query(F.data.startswith("gpriceedit:"))
@@ -2891,251 +2215,6 @@ async def add_multi_price(message: Message, state: FSMContext):
     await message.answer("✅ تعرفه جدید اضافه شد.", reply_markup=await multi_admin_list_kb())
 
 
-# ---------- Admin: مدیریت پنل‌های نمایندگی (سرویس‌های دلخواه ادمین) ----------
-@dp.callback_query(F.data == "adminpanels")
-async def admin_panels_root(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.clear()
-    await callback.message.edit_text(
-        "🖥 <b>مدیریت پنل‌های نمایندگی</b>\n"
-        "اینجا می‌تونید سرویس‌های جدید (مثل «خرید پنل نمایندگی») بسازید، هرکدوم رو باز کنید و گزینه‌های "
-        "داخلش (مثل پنل پاسارگاد، پنل سنایی و...) رو با متن و قیمت دلخواه اضافه/ویرایش/حذف کنید:",
-        parse_mode="HTML",
-        reply_markup=await panel_admin_categories_kb(),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("pcatopen:"))
-async def admin_panel_category_open(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    category_id = int(callback.data.split(":")[1])
-    category = await db.get_panel_category(category_id)
-    if not category:
-        await callback.answer("این پنل پیدا نشد.", show_alert=True)
-        return
-    await callback.message.edit_text(
-        f"🖥 <b>{category['name']}</b>\nگزینه‌های این پنل رو مدیریت کنید:",
-        parse_mode="HTML",
-        reply_markup=await panel_admin_category_detail_kb(category_id),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "pcatadd")
-async def start_add_panel_category(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    await state.set_state(AdminStates.adding_panel_category_name)
-    await callback.message.answer("نام سرویس/پنل جدید رو بفرستید (مثال: خرید پنل نمایندگی):")
-    await callback.answer()
-
-
-@dp.message(AdminStates.adding_panel_category_name)
-async def add_panel_category_name(message: Message, state: FSMContext):
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("لطفاً یه نام معتبر بفرستید.")
-        return
-    await db.add_panel_category(name)
-    await state.clear()
-    await message.answer("✅ پنل جدید اضافه شد.", reply_markup=await panel_admin_categories_kb())
-
-
-@dp.callback_query(F.data.startswith("pcatedit:"))
-async def start_edit_panel_category(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    category_id = int(callback.data.split(":")[1])
-    category = await db.get_panel_category(category_id)
-    if not category:
-        await callback.answer("این پنل پیدا نشد.", show_alert=True)
-        return
-    await state.update_data(category_id=category_id)
-    await state.set_state(AdminStates.editing_panel_category_name)
-    await callback.message.answer(f"نام جدید رو به‌جای «{category['name']}» بفرستید:")
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_panel_category_name)
-async def save_panel_category_name(message: Message, state: FSMContext):
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("لطفاً یه نام معتبر بفرستید.")
-        return
-    data = await state.get_data()
-    category_id = data.get("category_id")
-    await db.update_panel_category_name(category_id, name)
-    await state.clear()
-    await message.answer("✅ نام پنل بروزرسانی شد.", reply_markup=await panel_admin_categories_kb())
-
-
-@dp.callback_query(F.data.startswith("pcattoggle:"))
-async def toggle_panel_category(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    category_id = int(callback.data.split(":")[1])
-    await db.toggle_panel_category_active(category_id)
-    await callback.message.edit_reply_markup(reply_markup=await panel_admin_category_detail_kb(category_id))
-    await callback.answer("وضعیت پنل تغییر کرد.")
-
-
-@dp.callback_query(F.data.startswith("pcatdelete:"))
-async def delete_panel_category_handler(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    category_id = int(callback.data.split(":")[1])
-    await db.delete_panel_category(category_id)
-    await callback.message.edit_text(
-        "🖥 <b>مدیریت پنل‌های نمایندگی</b>\nهر سرویس رو از اینجا اضافه/ویرایش/حذف کنید:",
-        parse_mode="HTML",
-        reply_markup=await panel_admin_categories_kb(),
-    )
-    await callback.answer("✅ پنل و همه گزینه‌های داخلش حذف شدن.")
-
-
-@dp.callback_query(F.data.startswith("pitemadd:"))
-async def start_add_panel_item(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    category_id = int(callback.data.split(":")[1])
-    await state.update_data(category_id=category_id)
-    await state.set_state(AdminStates.adding_panel_item_title)
-    await callback.message.answer("متن/عنوان گزینه جدید رو بفرستید (مثلاً «لوکیشن آلمان - ۵ سرور»):")
-    await callback.answer()
-
-
-@dp.message(AdminStates.adding_panel_item_title)
-async def add_panel_item_title(message: Message, state: FSMContext):
-    title = (message.text or "").strip()
-    if not title:
-        await message.answer("لطفاً یه متن معتبر بفرستید.")
-        return
-    await state.update_data(title=title)
-    await state.set_state(AdminStates.adding_panel_item_price)
-    await message.answer(
-        "حالا نرخ «هر گیگ» این گزینه رو به تومان بفرستید (فقط عدد).\n"
-        "مثال: اگه بفرستید 2000، حجم ۲۵۰ گیگ خودکار میشه 500,000 تومان (چون 250 × 2000)."
-    )
-
-
-@dp.message(AdminStates.adding_panel_item_price)
-async def add_panel_item_price(message: Message, state: FSMContext):
-    text = (message.text or "").replace(",", "").strip()
-    if not text.isdigit():
-        await message.answer("لطفاً فقط عدد بفرستید (مثال: 250000)")
-        return
-    data = await state.get_data()
-    category_id = data.get("category_id")
-    title = data.get("title")
-    await db.add_panel_item(category_id, title, int(text))
-    await state.clear()
-    await message.answer("✅ گزینه جدید اضافه شد.", reply_markup=await panel_admin_category_detail_kb(category_id))
-
-
-@dp.callback_query(F.data.startswith("pitempriceedit:"))
-async def start_edit_panel_item_price(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    item_id = int(callback.data.split(":")[1])
-    item = await db.get_panel_item(item_id)
-    if not item:
-        await callback.answer("این گزینه پیدا نشد.", show_alert=True)
-        return
-    await state.update_data(item_id=item_id)
-    await state.set_state(AdminStates.editing_panel_item_price)
-    await callback.message.answer(
-        f"نرخ جدید «هر گیگ» رو برای «{item['title']}» به تومان بفرستید (فقط عدد؛ حجم‌های ۲۵۰ تا ۳۰۰۰ گیگ خودکار بر این اساس محاسبه میشن):"
-    )
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_panel_item_price)
-async def save_panel_item_price(message: Message, state: FSMContext):
-    text = (message.text or "").replace(",", "").strip()
-    if not text.isdigit():
-        await message.answer("لطفاً فقط عدد بفرستید (مثال: 250000)")
-        return
-    data = await state.get_data()
-    item_id = data.get("item_id")
-    item = await db.get_panel_item(item_id)
-    await db.update_panel_item_price(item_id, int(text))
-    await state.clear()
-    category_id = item["category_id"] if item else None
-    kb = await panel_admin_category_detail_kb(category_id) if category_id else await panel_admin_categories_kb()
-    await message.answer("✅ قیمت بروزرسانی شد.", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("pitemedittext:"))
-async def start_edit_panel_item_title(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    item_id = int(callback.data.split(":")[1])
-    item = await db.get_panel_item(item_id)
-    if not item:
-        await callback.answer("این گزینه پیدا نشد.", show_alert=True)
-        return
-    await state.update_data(item_id=item_id)
-    await state.set_state(AdminStates.editing_panel_item_title)
-    await callback.message.answer(f"متن جدید رو به‌جای «{item['title']}» بفرستید:")
-    await callback.answer()
-
-
-@dp.message(AdminStates.editing_panel_item_title)
-async def save_panel_item_title(message: Message, state: FSMContext):
-    title = (message.text or "").strip()
-    if not title:
-        await message.answer("لطفاً یه متن معتبر بفرستید.")
-        return
-    data = await state.get_data()
-    item_id = data.get("item_id")
-    item = await db.get_panel_item(item_id)
-    await db.update_panel_item_title(item_id, title)
-    await state.clear()
-    category_id = item["category_id"] if item else None
-    kb = await panel_admin_category_detail_kb(category_id) if category_id else await panel_admin_categories_kb()
-    await message.answer("✅ متن بروزرسانی شد.", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("pitemtoggle:"))
-async def toggle_panel_item(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    item_id = int(callback.data.split(":")[1])
-    item = await db.get_panel_item(item_id)
-    category_id = item["category_id"] if item else None
-    await db.toggle_panel_item_active(item_id)
-    kb = await panel_admin_category_detail_kb(category_id) if category_id else await panel_admin_categories_kb()
-    await callback.message.edit_reply_markup(reply_markup=kb)
-    await callback.answer("وضعیت گزینه تغییر کرد.")
-
-
-@dp.callback_query(F.data.startswith("pitemdelete:"))
-async def delete_panel_item_handler(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in config.ADMIN_IDS:
-        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
-        return
-    item_id = int(callback.data.split(":")[1])
-    item = await db.get_panel_item(item_id)
-    category_id = item["category_id"] if item else None
-    await db.delete_panel_item(item_id)
-    kb = await panel_admin_category_detail_kb(category_id) if category_id else await panel_admin_categories_kb()
-    await callback.message.edit_reply_markup(reply_markup=kb)
-    await callback.answer("✅ گزینه حذف شد.")
-
-
 # ---------- Admin handlers ----------
 @dp.callback_query(F.data.startswith("approve:"))
 async def admin_approve(callback: CallbackQuery, state: FSMContext):
@@ -3153,11 +2232,9 @@ async def admin_approve(callback: CallbackQuery, state: FSMContext):
     await state.update_data(order_id=order_id)
     await state.set_state(AdminStates.waiting_for_panel_info)
 
-    is_trial = order["order_type"] == "trial"
-    label = "درخواست تست" if is_trial else "سفارش"
     await callback.message.answer(
-        f"✅ {label} #{order_id} تأیید شد.\n"
-        f"حالا لطفاً اطلاعات {'اکانت تست' if is_trial else 'سرویس'} (کانفیگ/یوزر/پس/لینک و ...) رو برای ارسال به مشتری بفرستید:"
+        f"✅ سفارش #{order_id} تأیید شد.\n"
+        f"حالا لطفاً اطلاعات سرویس (کانفیگ/یوزر/پس/لینک و ...) رو برای ارسال به مشتری بفرستید:"
     )
     await callback.answer()
 
@@ -3176,29 +2253,19 @@ async def admin_send_panel_info(message: Message, state: FSMContext):
     await db.deliver_order(order_id, panel_info)
     await state.clear()
 
-    is_trial = order["order_type"] == "trial"
     try:
-        if is_trial:
-            await bot.send_message(
-                order["user_id"],
-                f"🎁 اکانت تست شما (#{order_id}) آماده شد!\n\n"
-                f"🔑 اطلاعات اتصال:\n{panel_info}\n\n"
-                f"این یک اکانت آزمایشی و محدوده. برای خرید نسخه کامل از «🛍 خرید سرویس» استفاده کنید.",
-            )
-        else:
-            await bot.send_message(
-                order["user_id"],
-                f"🎉 سفارش شما (#{order_id}) تأیید و تحویل داده شد!\n\n"
-                f"🔑 اطلاعات سرویس شما:\n{panel_info}",
-            )
-        await message.answer(f"✅ اطلاعات {'تست' if is_trial else 'سرویس'} با موفقیت برای مشتری سفارش #{order_id} ارسال شد.")
+        await bot.send_message(
+            order["user_id"],
+            f"🎉 سفارش شما (#{order_id}) تأیید و تحویل داده شد!\n\n"
+            f"🔑 اطلاعات سرویس شما:\n{panel_info}",
+        )
+        await message.answer(f"✅ اطلاعات سرویس با موفقیت برای مشتری سفارش #{order_id} ارسال شد.")
     except Exception as e:
         await message.answer(f"⚠️ ارسال به کاربر ناموفق بود: {e}")
 
     # رفرال دائمی پورسانتی: به‌ازای هر خرید موفق (تحویل‌شده) کاربری که با لینک یه نفر دیگه وارد شده،
     # درصدی از مبلغ خرید به‌صورت نقدی به کیف پول دعوت‌کننده اضافه میشه - این کار به تعداد نامحدود تکرار میشه
-    # (تحویل اکانت تست چون خرید واقعی نیست، باعث فعال شدن رفرال یا پورسانت نمیشه)
-    referral = await db.get_referral_by_referred(order["user_id"]) if not is_trial else None
+    referral = await db.get_referral_by_referred(order["user_id"])
     if referral:
         if not referral["converted"]:
             await db.mark_referral_converted(order["user_id"])
@@ -3286,11 +2353,6 @@ async def main():
         raise RuntimeError("BOT_TOKEN تنظیم نشده! متغیر محیطی BOT_TOKEN رو ست کنید.")
     if not config.ADMIN_IDS:
         logging.warning("ADMIN_IDS تنظیم نشده! هیچ ادمینی سفارش‌ها رو دریافت نمی‌کنه.")
-    if _force_join_channel_username():
-        logging.info(
-            f"عضویت اجباری در کانال {_force_join_channel_username()} فعاله. "
-            f"مطمئن شوید ربات به عنوان ادمین توی این کانال اضافه شده، وگرنه چک عضویت کار نمی‌کنه."
-        )
 
     await db.init_db()
     await bot.delete_webhook(drop_pending_updates=True)

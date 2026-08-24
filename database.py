@@ -161,6 +161,30 @@ async def init_db():
         await db.execute("UPDATE orders SET original_price = price WHERE original_price IS NULL")
         await db.commit()
 
+        # مهاجرت: ستون‌های جدول users (برای دیتابیس‌های قدیمی‌تر که این جدول رو با ستون‌های کمتر دارن)
+        for col_def in (
+            "username TEXT",
+            "full_name TEXT",
+            "joined_at TEXT",
+            "last_seen TEXT",
+        ):
+            col_name = col_def.split()[0]
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
+                await db.commit()
+            except Exception:
+                pass  # ستون از قبل وجود داره
+        # برای کاربرهای قدیمی که joined_at/last_seen نداشتن، یه مقدار پیش‌فرض ثبت می‌کنیم
+        await db.execute(
+            "UPDATE users SET joined_at = COALESCE(joined_at, ?) WHERE joined_at IS NULL",
+            (datetime.now().isoformat(),),
+        )
+        await db.execute(
+            "UPDATE users SET last_seen = COALESCE(last_seen, ?) WHERE last_seen IS NULL",
+            (datetime.now().isoformat(),),
+        )
+        await db.commit()
+
         # اولین اجرا: اگه جدول‌های تعرفه خالی بودن، از مقادیر پیش‌فرض config.py پر می‌شن
         import config
 
@@ -596,6 +620,14 @@ async def count_users() -> int:
         return row[0] if row else 0
 
 
+async def get_all_user_ids():
+    """آیدی عددی همه‌ی کاربرانی که ربات رو استارت کردن (برای ارسال پیام همگانی)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users")
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+
 async def get_recent_orders(limit: int = 15):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -630,7 +662,15 @@ async def get_admin_role(user_id: int):
 async def list_admins():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM admins ORDER BY added_at DESC")
+        cursor = await db.execute(
+            """
+            SELECT admins.user_id, admins.role, admins.added_by, admins.added_at,
+                   users.username, users.full_name
+            FROM admins
+            LEFT JOIN users ON users.user_id = admins.user_id
+            ORDER BY admins.added_at DESC
+            """
+        )
         return await cursor.fetchall()
 
 
